@@ -1,62 +1,62 @@
 # TIRD Newsletter Collector
 
-ดาวน์โหลด Newsletter จาก TIRD ด้วย `curl.exe` และดูแลรายการผ่าน Terminal UI (Textual + Rich) สำหรับ **บัญชีที่ได้รับสิทธิ์เข้าถึงเท่านั้น**
+Desktop terminal collector for **Actuarial Advisory** and **Business Insights** research publications. It uses the website's existing, authorized session, `curl.exe` for HTTP, and **Textual/Rich** for the UI. Parallel PDF download uses `ThreadPoolExecutor`, a shared request interval, per-section CSV manifests, PDF-signature checks and SHA256.
 
-**HTTP Engine:** `curl.exe` ของ Windows — คงการส่ง Credentials ผ่าน `stdin` ตาม Collector v4.0 ซึ่งผ่านการทดสอบ `GetService` และ `GetServiceById` แล้ว ไม่ได้เปลี่ยนไปใช้ `requests` แทน
+## Set up (Windows)
 
-## ติดตั้งครั้งแรก (Windows)
-
-1. ติดตั้ง Python 3.10+ และตรวจว่า Windows มี `curl.exe` (`where curl.exe`)
-2. เปิด PowerShell ในโฟลเดอร์โปรเจกต์ แล้วติดตั้ง Dependencies:
+1. Copy `.env.example` to `.env` in this directory.
+2. Open TIRD in Chrome and sign in normally.
+3. Open **Actuarial Advisory → Article / Research**. In Chrome `F12 → Network → Fetch/XHR`, select `GetService` and copy the `Authorization`, `Cookie`, and **Referer** request headers to `TIRD_AUTHORIZATION`, `TIRD_COOKIE`, `TIRD_REFERER` in `.env`.
+4. Open **Business Insights → Article / Research**, select that page's `GetService` request and copy its Referer to `TIRD_INSIGHTS_REFERER`. If that request uses a different session, also set `TIRD_INSIGHTS_COOKIE` and `TIRD_INSIGHTS_AUTHORIZATION`.
+5. In PowerShell, execute:
 
    ```powershell
-   py -3 -m venv .venv
-   .\.venv\Scripts\Activate.ps1
    python -m pip install -r requirements.txt
-   ```
-
-3. คัดลอก `.env.example` เป็น `.env`
-
-   ```powershell
-   Copy-Item .env.example .env
-   ```
-
-4. ขณะเข้าสู่ระบบ TIRD ด้วยบัญชีของคุณ เปิด DevTools → Network → `/Content/GetService` → Headers แล้วใส่ **Authorization**, **Cookie** และ **Referer** จาก Request ที่ได้รับอนุญาตลงใน `.env` ห้ามเติม `Bearer` เองหาก Browser ไม่ได้ส่งคำนั้น
-
-5. ดับเบิลคลิก **`START_TIRD.bat`** หรือใช้:
-
-   ```powershell
    python tird_collector.py
    ```
 
-## ใช้งาน Terminal UI
+   You can also double-click `START_TIRD.bat` to open the UI.
 
-- `REFRESH`: ตรวจ Session และโหลด Catalog ใหม่ (แสดงความผิดพลาดบนหน้าจอโดยไม่ปิดแอป)
-- ช่อง **Search** และ **Year**: กรองชื่อเอกสารและปี (`2026` หรือ `2569`)
-- กด **Enter** บนแถวเอกสารเพื่อเลือกหรือยกเลิกเลือก
-- `DOWNLOAD SELECTED`: ดาวน์โหลดเฉพาะแถวที่เลือกภายในผลการกรอง
-- `DOWNLOAD ALL`: ดาวน์โหลดทุกแถวที่แสดงอยู่ (เคารพตัวกรอง)
-- `STOP`: หยุดหลังคำขอปัจจุบันเสร็จ ไม่ยกเลิกคำขอที่กำลังส่ง
-- `OPEN FOLDER`: เปิดโฟลเดอร์ผลลัพธ์
+**Important:** Two separate pages or different Referers do not necessarily imply two different API results. If both configurations return the same service IDs, the app reports this instead of mislabeling documents. Use DevTools to confirm each section's request/response. If `TIRD_INSIGHTS_REFERER` is missing, the UI still displays Advisor but marks Insights as not configured. The program cannot invent section IDs or acquire credentials automatically.
 
-โปรแกรมข้าม PDF ที่มีอยู่และบันทึกสำเร็จแล้วโดยอัตโนมัติ ยกเว้นเริ่มด้วย `--force` ข้อมูลจัดเก็บตาม `TIRD_Newsletter/<ปี ค.ศ.>/<เดือน>/` พร้อม `manifest.csv` และ SHA-256
+## Terminal UI
 
-## โหมดคำสั่งเดิม (ยังใช้ได้)
+- **Category**: All sections / Actuarial Advisory / Business Insights.
+- **Search + year**: filter displayed documents.
+- **Enter**: select or deselect a row.
+- **Download Selected**: collect selected visible rows.
+- **Download All**: collect all visible filtered rows from one or both sections.
+- **Stop**: stop pending work; an in-flight request may finish first.
+- **Open Folder**: inspect PDF output and manifests.
+
+Activity, section counts, PDF statuses and progress appear in the terminal.
+
+## CLI commands
 
 ```powershell
-python tird_collector.py --test-only    # ตรวจ GetService และ GetServiceById เท่านั้น
-python tird_collector.py --list         # แสดงรายการ
-python tird_collector.py --headless     # ดาวน์โหลดทั้งหมดโดยไม่เปิด UI
-python tird_collector.py --limit 1      # ดาวน์โหลดเฉพาะ 1 รายการ
-python tird_collector.py --year 2026   # กรองปี
-python tird_collector.py --ui          # บังคับเปิด UI
+python tird_collector.py --test-only
+python tird_collector.py --list --scope both
+python tird_collector.py --headless --scope both --parallel 3
+python tird_collector.py --headless --scope insights --year 2569 --parallel 3
+python tird_collector.py --headless --scope advisor --limit 1
+python tird_collector.py --ui
+python -m unittest discover -s tests -v
 ```
 
-> **หมายเหตุ:** การทดสอบ `--test-only` ที่ผ่านแล้ว **ยังไม่ได้ยืนยันการดาวน์โหลด PDF**; ทดสอบ `--limit 1` ก่อนดาวน์โหลดทั้งหมดจริง
+`--parallel` defaults to **3**; supports **1–6**. `--delay` defaults to **0.2 seconds minimum between HTTP request starts across all workers**. Do not increase concurrency excessively on this service. `--force` redownloads previously completed PDFs.
 
-## ความปลอดภัย
+## Files
 
-- `TIRD_COOKIE` และ `TIRD_AUTHORIZATION` เป็นความลับ เก็บเฉพาะใน `.env` ซึ่ง Git ไม่ติดตาม
-- ถ้า Session หมดอายุ ให้ Login ใหม่ และอัปเดต `.env` แล้วกด `REFRESH`
-- ไม่มีระบบข้าม Login, ตรวจสิทธิ์ หรือมาตรการป้องกันการเข้าถึงของเว็บไซต์
-- อย่าแนบ Logs, Screenshot หรือ Configuration ที่มี Credentials จริงลง Repository
+```text
+TIRD_Newsletter/
+  advisor/
+    manifest.csv
+    YYYY/MM/*.pdf
+  insights/
+    manifest.csv
+    YYYY/MM/*.pdf
+```
+
+Old v4 PDFs under the previous output layout are untouched and recognized from the root manifest as completed Advisor documents. Each category has its own resume manifest and each PDF is validated before being marked saved. The app does not bypass authentication or TLS verification.
+
+**Security:** Never commit `.env`, curl commands containing live cookies, or personal access tokens. Refresh the browser session if credentials have previously been shared. The live two-section API requests and PDF transfers must be verified on your own authorized Windows session.
