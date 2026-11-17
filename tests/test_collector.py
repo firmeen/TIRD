@@ -1,9 +1,9 @@
-"""Network-free smoke tests for the original curl engine."""
+"""Network-free smoke tests for the original curl transport compatibility."""
+import sys
 import unittest
 from pathlib import Path
-from argparse import Namespace
-from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tird_collector as tird
 
 
@@ -21,9 +21,9 @@ class CollectorSmokeTests(unittest.TestCase):
             output=Path("."), timeout=10,
         )
         encoded = tird.CurlTransport(cfg).build_config(tird.API["catalog"], None, True)
-        self.assertIn(b'content-length: 0', encoded)
-        self.assertIn(b'TEST_AUTH', encoded)
-        self.assertIn(b'TEST_COOKIE=abc', encoded)
+        self.assertIn(b"content-length: 0", encoded)
+        self.assertIn(b"TEST_AUTH", encoded)
+        self.assertIn(b"TEST_COOKIE=abc", encoded)
 
 
 if __name__ == "__main__":
