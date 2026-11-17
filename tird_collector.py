@@ -947,7 +947,8 @@ class CurlTransport:
             ),
             (
                 "sec-ch-ua-platform",
-                '"Windows"',            ),
+                '"Windows"',
+            ),
             (
                 "sec-fetch-dest",
                 "empty",
@@ -1896,7 +1897,8 @@ class Manifest:
         return True
 
     def upsert(
-        self,        record: dict,
+        self,
+        record: dict,
     ) -> None:
 
         service_id = record[
