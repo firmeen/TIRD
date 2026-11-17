@@ -128,11 +128,11 @@ class TIRDApp(App):
         for name, width in (("PICK", 5), ("ISSUE", 8), ("DATE", 12), ("NEWSLETTER", 72), ("STATUS", 14)):
             table.add_column(name, key=name, width=width)
         self._buttons()
-        self.log("Terminal ready. Credentials are loaded from local .env only.")
+        self.write_log("Terminal ready. Credentials are loaded from local .env only.")
         # Defer network operations until Textual has rendered the screen.
         self.set_timer(0.25, self.action_refresh)
 
-    def log(self, message: str, level: str = "info") -> None:
+    def write_log(self, message: str, level: str = "info") -> None:
         colors = {"info": "#b8cbd3", "ok": "#85d6ba", "warn": "#e7c48e", "error": "#f1a1a4"}
         color = colors.get(level, colors["info"])
         self.query_one("#activity", RichLog).write(
@@ -217,7 +217,7 @@ class TIRDApp(App):
         self.loaded = False
         self._buttons()
         self._session("CHECKING", "GetService + GetServiceById")
-        self.log("Checking authorized TIRD session and loading catalog...")
+        self.write_log("Checking authorized TIRD session and loading catalog...")
         self._load_worker()
 
     @work(thread=True, group="catalog", exclusive=True)
@@ -241,7 +241,7 @@ class TIRDApp(App):
         self.refreshing = False
         if error:
             self._session("ERROR", "See activity log; the app remains open")
-            self.log(error, "error")
+            self.write_log(error, "error")
             self.loaded = bool(self.services)
         else:
             self.services = services
@@ -250,7 +250,7 @@ class TIRDApp(App):
             self.selected.intersection_update({self.api.service_id_of(s) for s in services})
             self.loaded = True
             self._session("CONNECTED", f"{len(services)} accessible documents / curl.exe")
-            self.log(f"GetService: PASS | GetServiceById: PASS | {len(services)} documents", "ok")
+            self.write_log(f"GetService: PASS | GetServiceById: PASS | {len(services)} documents", "ok")
             self._render_catalog()
         self._buttons()
 
@@ -258,10 +258,10 @@ class TIRDApp(App):
         if self.busy or self.refreshing:
             return
         if not self.loaded:
-            self.log("Refresh catalog before downloading.", "warn")
+            self.write_log("Refresh catalog before downloading.", "warn")
             return
         if not services:
-            self.log("No documents selected for this action.", "warn")
+            self.write_log("No documents selected for this action.", "warn")
             return
         self.stop_event.clear()
         self.run_id += 1
@@ -271,7 +271,7 @@ class TIRDApp(App):
         progress = self.query_one("#progress", ProgressBar)
         progress.update(total=len(services), progress=0)
         self.query_one("#progress_caption", Static).update(f"RUNNING / 0 of {len(services)}")
-        self.log(f"Downloading {len(services)} newsletters sequentially...")
+        self.write_log(f"Downloading {len(services)} newsletters sequentially...")
         self._download_worker(self.run_id, list(services))
 
     def action_download_selected(self) -> None:
@@ -284,7 +284,7 @@ class TIRDApp(App):
     def action_stop(self) -> None:
         if self.busy:
             self.stop_event.set()
-            self.log("Stop requested. Current request will finish before stopping.", "warn")
+            self.write_log("Stop requested. Current request will finish before stopping.", "warn")
 
     @work(thread=True, group="download", exclusive=True)
     def _download_worker(self, run_id: int, services: list[dict]) -> None:
@@ -323,7 +323,7 @@ class TIRDApp(App):
             self.stats["failed"] += 1
         self.query_one("#progress", ProgressBar).update(progress=index)
         self.query_one("#progress_caption", Static).update(f"{state} / {index} of {total}")
-        self.log(f"[{index}/{total}] {state} | {service_id}", "ok" if state == "SAVED" else "warn" if state == "FAILED" else "info")
+        self.write_log(f"[{index}/{total}] {state} | {service_id}", "ok" if state == "SAVED" else "warn" if state == "FAILED" else "info")
         self._render_catalog()
 
     def _finish_download(self, run_id: int, state: str, error: str | None) -> None:
@@ -335,11 +335,11 @@ class TIRDApp(App):
             f"{state} / {self.stats['downloaded']} saved · {self.stats['skipped']} skipped · {self.stats['failed']} failed"
         )
         if error:
-            self.log(error, "error")
+            self.write_log(error, "error")
             if "AuthenticationError" in error:
                 self._session("ERROR", "Authentication rejected; refresh your authorized session")
         else:
-            self.log(f"Collection {state.lower()}. PDF output: {self.output}", "ok" if state == "DONE" else "warn")
+            self.write_log(f"Collection {state.lower()}. PDF output: {self.output}", "ok" if state == "DONE" else "warn")
         self._summary()
 
     def action_open_output(self) -> None:
@@ -350,7 +350,7 @@ class TIRDApp(App):
             else:
                 subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(self.output)])
         except OSError as exc:
-            self.log(f"Could not open output: {exc}", "error")
+            self.write_log(f"Could not open output: {exc}", "error")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
