@@ -269,10 +269,14 @@ class ParallelArchive:
         collector = self.collectors.get(scope_slug)
         if collector is None:
             return False
+        from tird_live import known_scope_for_id
+        # Legacy main manifest may contain PDFs downloaded when the UI
+        # mistakenly labeled a live Insights catalog as Advisor.
+        # Attribute a legacy PDF only from the verified Service_id.
         return (
             collector.manifest.completed(service_id)
             or (
-                scope_slug == "advisor"
+                known_scope_for_id(service_id) == scope_slug
                 and self.legacy_advisor_manifest.completed(service_id)
             )
         )
