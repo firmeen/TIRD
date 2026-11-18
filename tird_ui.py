@@ -14,17 +14,19 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, ProgressBar, RichLog, Select, Static
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, ProgressBar, RichLog, Static
 
-from tird_scopes import configured_scopes, collect_catalogs, diagnose_scope_routing, ParallelArchive, ScopedDocument
+from tird_scopes import ParallelArchive, ScopedDocument
+from tird_live import fetch_live_snapshot, catalog_signature, known_scope_for_id, LABELS
+
+LIVE_REFRESH_SECONDS = 1.0
 
 
 class TIRDApp(App):
     TITLE = "TIRD Collector"
-    SUB_TITLE = "Advisor + Business Insights / Parallel PDF archive"
+    SUB_TITLE = "Live session catalog / 1-second sync / Parallel PDFs"
     BINDINGS = [
         ("ctrl+r", "refresh", "Refresh"),
-        ("ctrl+t", "verify_routing", "Verify A/B/A"),
         ("ctrl+d", "download_selected", "Download selected"),
         ("ctrl+o", "open_output", "Open folder"),
         ("ctrl+s", "stop", "Stop"),
@@ -44,14 +46,16 @@ class TIRDApp(App):
     Button:hover { background: #3d6b80; }
     Button:disabled { opacity: 0.45; }
     #download_selected, #download_all { background: #24675c; }
-    #verify { background: #665637; }
     #stop { background: #70474b; }
     #filters { height: 5; margin-top: 1; }
     .field { width: 1fr; margin-right: 1; }
     .field Label { height: 1; color: #b1c0ca; }
     Input { height: 3; background: #152530; border: tall #2f4553; color: #eff4f6; }
     Input:focus { border: tall #b6a17d; }
-    Select { height: 3; background: #152530; }
+    #current_category {
+        height: 3; background: #152530; border: tall #2f4553;
+        color: #d0bd99; padding: 0 1; content-align: left middle;
+    }
     #summary { height: 3; margin-top: 1; padding: 0 2; background: #1b2b36;
                border: solid #304653; content-align: left middle; }
     #catalog_box { height: 1fr; min-height: 8; margin-top: 1; border: solid #304653; }
@@ -86,33 +90,34 @@ class TIRDApp(App):
         self.run_id = 0
         self.stats = {"downloaded": 0, "skipped": 0, "failed": 0, "cancelled": 0}
         self.output = Path(args.output)
+        self.poll_paused = False
+        self.pending_download: list[ScopedDocument] | None = None
+        self.catalog_signature: tuple | None = None
+        self.active_scope: str = "unknown"
+        self.last_poll_error: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(id="main"):
-            yield Static("TIRD / NEWSLETTER COLLECTOR                 ADVISOR + BUSINESS INSIGHTS", id="brand")
+            yield Static("TIRD / NEWSLETTER COLLECTOR                 LIVE SESSION / 1s AUTO REFRESH", id="brand")
             yield Static("SESSION / NOT CHECKED", id="status")
             with Horizontal(id="toolbar"):
                 yield Button("REFRESH", id="refresh")
-                yield Button("VERIFY A/B/A", id="verify")
                 yield Button("DOWNLOAD SELECTED", id="download_selected")
                 yield Button("DOWNLOAD ALL", id="download_all")
                 yield Button("STOP", id="stop")
                 yield Button("OPEN FOLDER", id="folder")
             with Horizontal(id="filters"):
                 with Vertical(classes="field"):
-                    yield Label("CATEGORY")
-                    yield Select(
-                        [("All sections", "both"), ("Actuarial Advisory", "advisor"), ("Business Insights", "insights")],
-                        value="both", allow_blank=False, id="scope_filter",
-                    )
+                    yield Label("CURRENT CHROME SECTION (AUTO)")
+                    yield Static("Detecting current session...", id="current_category")
                 with Vertical(classes="field"):
                     yield Label("SEARCH")
                     yield Input(placeholder="Title, issue, keyword...", id="search")
                 with Vertical(classes="field"):
                     yield Label("YEAR")
                     yield Input(placeholder="All / 2026 / 2569", id="year")
-            yield Static("ADVISOR 0   INSIGHTS 0   SELECTED 0   SAVED 0   SKIPPED 0   FAILED 0", id="summary")
+            yield Static("LIVE / UNKNOWN   DOCUMENTS 0   SELECTED 0   SAVED 0   SKIPPED 0   FAILED 0", id="summary")
             with Vertical(id="catalog_box"):
                 yield Static("DOCUMENT CATALOG  /  ENTER TO SELECT  /  CATEGORY-SPECIFIC ARCHIVES", id="catalog_heading")
                 yield DataTable(id="catalog", cursor_type="row", zebra_stripes=True)
@@ -129,8 +134,12 @@ class TIRDApp(App):
         for title, width in (("PICK", 5), ("CATEGORY", 19), ("ISSUE", 7), ("DATE", 12), ("NEWSLETTER", 68), ("STATUS", 13)):
             table.add_column(title, key=title, width=width)
         self._buttons()
-        self.write_log("Terminal ready. Both sections use authorized local .env configuration.")
-        self.set_timer(0.25, self.action_refresh)
+        self.write_log(
+            "Live session polling every 1 second. You control Chrome manually. "
+            "Refresh pauses during PDF downloads."
+        )
+        self.set_interval(LIVE_REFRESH_SECONDS, self.action_refresh)
+        self.set_timer(0.1, self.action_refresh)
 
     # Do NOT name this method log(): it would shadow Textual App.log.system.
     def write_log(self, message: str, level: str = "info") -> None:
@@ -148,14 +157,17 @@ class TIRDApp(App):
         self.query_one("#status", Static).update(view)
 
     def _buttons(self) -> None:
-        self.query_one("#refresh", Button).disabled = self.busy or self.refreshing
-        self.query_one("#verify", Button).disabled = self.busy or self.refreshing
-        self.query_one("#download_selected", Button).disabled = self.busy or self.refreshing or not self.loaded
-        self.query_one("#download_all", Button).disabled = self.busy or self.refreshing or not self.loaded
+        self.query_one("#refresh", Button).disabled = (
+            self.busy or self.refreshing or self.poll_paused
+        )
+        # Download controls stay available during a poll. A click freezes the
+        # last DISPLAYED snapshot and starts only after the in-flight poll ends.
+        cannot_download = self.busy or not self.loaded or self.pending_download is not None
+        self.query_one("#download_selected", Button).disabled = cannot_download
+        self.query_one("#download_all", Button).disabled = cannot_download
         self.query_one("#stop", Button).disabled = not self.busy
 
     def _filtered(self) -> list[ScopedDocument]:
-        category = self.query_one("#scope_filter", Select).value
         query = self.query_one("#search", Input).value.casefold().strip()
         year_text = self.query_one("#year", Input).value.strip()
         year = int(year_text) if year_text.isdecimal() else None
@@ -163,8 +175,6 @@ class TIRDApp(App):
             year -= 543
         matched = []
         for document in self.documents:
-            if category in ("advisor", "insights") and document.scope != category:
-                continue
             subtitle = self.api.service_subtitle_of(document.service)
             title = self.api.service_title_of(document.service)
             published = self.api.parse_thai_date(subtitle)
@@ -176,12 +186,13 @@ class TIRDApp(App):
         return matched
 
     def _summary(self) -> None:
-        counts = Counter(row.scope for row in self.documents)
+        sync = "PAUSED (DOWNLOADING)" if self.poll_paused else "AUTO 1s"
         self.query_one("#summary", Static).update(
-            f"ADVISOR {counts['advisor']}    INSIGHTS {counts['insights']}    "
-            f"VISIBLE {len(self._filtered())}    SELECTED {len(self.selected)}    "
+            f"CURRENT {LABELS[self.active_scope].upper()}    "
+            f"DOCUMENTS {len(self.documents)}    VISIBLE {len(self._filtered())}    "
+            f"SELECTED {len(self.selected)}    "
             f"SAVED {self.stats['downloaded']}    SKIPPED {self.stats['skipped']}    "
-            f"FAILED {self.stats['failed']}"
+            f"FAILED {self.stats['failed']}    SYNC {sync}"
         )
 
     def _render_catalog(self) -> None:
@@ -203,10 +214,6 @@ class TIRDApp(App):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id in {"search", "year"} and self.is_mounted:
-            self._render_catalog()
-
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "scope_filter" and self.is_mounted:
             self._render_catalog()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
