@@ -1482,11 +1482,10 @@ class TIRDClient:
     # CATALOG
     # --------------------------------------------------------
 
-    def get_services(self) -> list[dict]:
+    def get_services(self, *, quiet: bool = False) -> list[dict]:
 
-        LOG.info(
-            "Fetching TIRD newsletter catalog"
-        )
+        if not quiet:
+            LOG.info("Fetching TIRD newsletter catalog")
 
         result = self.post_json(
             API["catalog"],
@@ -1563,15 +1562,9 @@ class TIRDClient:
 
             accessible.append(service)
 
-        LOG.info(
-            "Catalog records: %s",
-            len(services),
-        )
-
-        LOG.info(
-            "Accessible documents: %s",
-            len(accessible),
-        )
+        if not quiet:
+            LOG.info("Catalog records: %s", len(services))
+            LOG.info("Accessible documents: %s", len(accessible))
 
         return accessible
 
