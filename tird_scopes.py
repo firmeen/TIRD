@@ -65,6 +65,12 @@ def _scope_config(base: Any, prefix: str, *, default: bool) -> Any | None:
 def configured_scopes(base: Any, selection: str = "both") -> list[Scope]:
     if selection not in ("both", "advisor", "insights"):
         raise ValueError("Invalid TIRD scope")
+    if selection in ("both", "advisor") and not os.getenv("TIRD_ADVISOR_REFERER", "").strip():
+        LOG.warning(
+            "Advisor is using the legacy TIRD_REFERER. Set "
+            "TIRD_ADVISOR_REFERER explicitly to verify that this is "
+            "the Advisor / Article Research page, not Business Insights."
+        )
     entries = [
         Scope("advisor", "Actuarial Advisory", _scope_config(base, "ADVISOR", default=True)),
         Scope("insights", "Business Insights", _scope_config(base, "INSIGHTS", default=False)),
@@ -72,18 +78,119 @@ def configured_scopes(base: Any, selection: str = "both") -> list[Scope]:
     return [scope for scope in entries if selection == "both" or scope.slug == selection]
 
 
-def collect_catalogs(scopes: list[Scope]) -> tuple[list[ScopedDocument], dict[str, str]]:
-    """Make independent, sequential requests for each section.
+def _same_request_context(left: Scope, right: Scope) -> bool:
+    """True only if the two HTTP requests would use identical routing inputs."""
+    if left.config is None or right.config is None:
+        return False
+    return all(
+        getattr(left.config, key) == getattr(right.config, key)
+        for key in ("referer", "cookie", "authorization")
+    )
 
-    If both sections unexpectedly return identical IDs, do not mislabel or
-    duplicate documents. Instead report the session/routing inconsistency.
+
+@dataclass(frozen=True)
+class RoutingDiagnostic:
+    advisor_first: int
+    insights: int
+    advisor_repeat: int
+    overlap: int
+    advisor_stable: bool
+    distinct: bool
+    shared_credentials: bool
+
+    @property
+    def consistent(self) -> bool:
+        """A/B/A success: both catalogs exist, are disjoint and A is repeatable."""
+        return (
+            self.advisor_first > 0
+            and self.insights > 0
+            and self.advisor_stable
+            and self.distinct
+        )
+
+
+def diagnose_scope_routing(scopes: list[Scope]) -> RoutingDiagnostic:
+    """Verify the observed browser A/B/A routing using live authorized curl.
+
+    Three sequential POST /Content/GetService calls:
+        A = Advisor Referer
+        B = Business Insights Referer
+        A = Advisor Referer again
+
+    Cookies and Authorization remain unchanged when both scopes inherit the
+    base credentials. No PDFs are requested. Never print credential values.
+    """
+    from tird_collector import TIRDClient, ConfigurationError, service_id_of
+
+    scope_map = {scope.slug: scope for scope in scopes}
+    if set(scope_map) != {"advisor", "insights"}:
+        raise ConfigurationError("--diagnose-scopes requires --scope both")
+
+    advisor, insights = scope_map["advisor"], scope_map["insights"]
+    if advisor.config is None or insights.config is None:
+        raise ConfigurationError(
+            "Both TIRD_ADVISOR_REFERER and TIRD_INSIGHTS_REFERER must be "
+            "configured for A/B/A diagnostics"
+        )
+    if _same_request_context(advisor, insights):
+        raise ConfigurationError(
+            "Both sections use the same Referer/Cookie/Authorization. "
+            "Configure distinct TIRD_ADVISOR_REFERER and TIRD_INSIGHTS_REFERER."
+        )
+
+    def get_ids(scope: Scope) -> set[str]:
+        scope.config.output.mkdir(parents=True, exist_ok=True)
+        client = TIRDClient(scope.config, threading.Event())
+        return {service_id_of(s) for s in client.get_services() if service_id_of(s)}
+
+    first = get_ids(advisor)
+    second = get_ids(insights)
+    repeat = get_ids(advisor)
+    report = RoutingDiagnostic(
+        advisor_first=len(first),
+        insights=len(second),
+        advisor_repeat=len(repeat),
+        overlap=len(first & second),
+        advisor_stable=(first == repeat),
+        distinct=first.isdisjoint(second),
+        shared_credentials=(
+            advisor.config.cookie == insights.config.cookie
+            and advisor.config.authorization == insights.config.authorization
+        ),
+    )
+    LOG.info(
+        "Routing A/B/A: Advisor %s -> Insights %s -> Advisor %s | "
+        "overlap=%s stable=%s shared_credentials=%s",
+        report.advisor_first, report.insights, report.advisor_repeat,
+        report.overlap, report.advisor_stable, report.shared_credentials,
+    )
+    return report
+
+
+def collect_catalogs(scopes: list[Scope]) -> tuple[list[ScopedDocument], dict[str, str]]:
+    """Fetch each section with its own Referer and authorized session context.
+
+    Fail closed for identical HTTP request contexts or ANY overlapping IDs,
+    rather than inventing a section from the same or partially shared catalog.
     """
     from tird_collector import TIRDClient, service_id_of
 
     documents: list[ScopedDocument] = []
     errors: dict[str, str] = {}
     groups: dict[str, set[str]] = {}
+    processed: list[Scope] = []
     for scope in scopes:
+        if scope.config is not None and any(
+            _same_request_context(scope, previous)
+            for previous in processed
+        ):
+            errors[scope.slug] = (
+                "This section has exactly the same Referer, Cookie and "
+                "Authorization as another section. Set both explicit "
+                "TIRD_ADVISOR_REFERER and TIRD_INSIGHTS_REFERER values "
+                "from the separate browser GetService requests."
+            )
+            continue
         if scope.config is None:
             errors[scope.slug] = (
                 "Not configured: set TIRD_INSIGHTS_REFERER in .env "
@@ -99,13 +206,15 @@ def collect_catalogs(scopes: list[Scope]) -> tuple[list[ScopedDocument], dict[st
             if services:
                 client.get_service_key(service_id_of(services[0]))
             ids = {service_id_of(item) for item in services}
-            if ids and any(ids == previous for previous in groups.values()):
+            collisions = sum(len(ids & previous) for previous in groups.values())
+            if collisions:
                 errors[scope.slug] = (
-                    "This section returned the same catalog as another section; "
-                    "check the distinct Content Referer and authorized session "
-                    "in DevTools. No duplicate category was fabricated."
+                    f"This section overlaps another catalog by {collisions} "
+                    "Service IDs. Check each menu's Content Referer and "
+                    "authorized browser context. Refusing to mislabel documents."
                 )
                 continue
+            processed.append(scope)
             groups[scope.slug] = ids
             documents.extend(ScopedDocument(scope.slug, scope.label, row) for row in services)
             LOG.info("%s: %s accessible documents", scope.label, len(services))
