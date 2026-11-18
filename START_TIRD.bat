@@ -1,31 +1,24 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0" || exit /b 1
-title TIRD Newsletter Collector
-
 if not exist "tird_collector.py" (
-    echo [ERROR] tird_collector.py not found.
+    echo [ERROR] Missing tird_collector.py
     pause
     exit /b 1
 )
-
-if exist ".venv\Scripts\python.exe" (
-    set "PYTHON=.venv\Scripts\python.exe"
-) else (
-    where py.exe >nul 2>&1
+set "PYTHON=python"
+if exist ".venv\Scripts\python.exe" set "PYTHON=%CD%\.venv\Scripts\python.exe"
+if /I not "%~1"=="--inside" (
+    where wt.exe >nul 2>&1
     if not errorlevel 1 (
-        set "PYTHON=py -3"
-    ) else (
-        set "PYTHON=python"
+        wt.exe --window new --fullscreen new-tab --title "TIRD Collector" --startingDirectory "%CD%" cmd.exe /k ""%~f0" --inside"
+        exit /b 0
     )
 )
-
-%PYTHON% tird_collector.py --ui
-set "RESULT=%ERRORLEVEL%"
-if not "%RESULT%"=="0" (
+"%PYTHON%" tird_collector.py --ui
+if errorlevel 1 (
     echo.
-    echo [ERROR] TIRD exited with code %RESULT%.
-    echo Install dependencies: %PYTHON% -m pip install -r requirements.txt
+    echo [ERROR] TIRD UI exited with an error.
     pause
 )
-exit /b %RESULT%
+endlocal

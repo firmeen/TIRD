@@ -1,53 +1,58 @@
 
 """
+tird_collector.py
 TIRD NEWSLETTER COLLECTOR
-Version 4.0.0
-=========================
+Version 5.0.0
 
-HTTP Engine:
-    Windows curl.exe via subprocess
-    Credentials passed through stdin, not command-line arguments.
+HTTP ENGINE:
+    curl.exe via subprocess
 
-Requirements:
-    pip install python-dotenv rich textual
+DOWNLOAD ENGINE:
+    ThreadPoolExecutor + Shared Rate Limiter
 
-Required files:
-    tird_collector.py
-    .env
+REQUIREMENTS:
+    pip install python-dotenv rich
 
 .env:
     TIRD_AUTHORIZATION="YOUR_AUTHORIZATION"
     TIRD_COOKIE="YOUR_COMPLETE_COOKIE"
     TIRD_REFERER="https://tirdmember.tird.insure/Content?_mId=YOUR_ID"
 
-Commands:
-    python tird_collector.py --ui
-    python tird_collector.py --headless
+COMMANDS:
     python tird_collector.py --test-only
     python tird_collector.py --test-only --verbose
     python tird_collector.py --list
     python tird_collector.py --limit 1
+    python tird_collector.py --limit 3
+    python tird_collector.py --parallel 3
     python tird_collector.py --year 2026
-    python tird_collector.py --service-id YOUR_SERVICE_ID
+    python tird_collector.py --service-id SERVICE_ID
     python tird_collector.py
     python tird_collector.py --force
     python tird_collector.py --debug-response
 
-Features:
-    - Authenticated HTTP requests using curl.exe
-    - TIRD newsletter catalog discovery
-    - Service detail and workspace ID retrieval
-    - PDF download using ListFiles
-    - Resume and duplicate prevention
-    - Year/month directory organization
+FEATURES:
+    - Authenticated TIRD API
+    - curl.exe HTTP transport
+    - Parallel PDF downloads
+    - Shared request rate limiting
+    - Automatic retry for transient HTTP errors
+    - Thread-safe result handling
     - Atomic PDF writes
-    - SHA256 verification
+    - Resume and skip completed downloads
+    - PDF signature and SHA256 validation
     - CSV manifest
-    - Rich terminal output
+    - Rich terminal interface
     - Safe HTTP diagnostics
+    - Graceful interruption
 
-The collector uses an existing authorized session.
-It does not bypass authentication or access restrictions.
+SECURITY:
+    - Uses an existing authorized TIRD session.
+    - Credentials are read from .env.
+    - Credentials are passed to curl through stdin.
+    - Credentials are not included in command-line arguments.
+    - No TLS verification bypass.
+    - No authentication bypass.
 """
 
 from __future__ import annotations
@@ -63,14 +68,20 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+    Future,
+)
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 
@@ -94,11 +105,11 @@ except ImportError:
 
 
 # ============================================================
-# CONSTANTS
+# APPLICATION CONSTANTS
 # ============================================================
 
 APP_NAME = "TIRD NEWSLETTER COLLECTOR"
-APP_VERSION = "4.1.0"
+APP_VERSION = "5.1.0"
 
 BASE_URL = "https://tirdmember.tird.insure"
 
@@ -110,10 +121,15 @@ API = {
 }
 
 PROJECT_DIR = Path(__file__).resolve().parent
+
 DEFAULT_OUTPUT = PROJECT_DIR / "TIRD_Newsletter"
 
+DEFAULT_PARALLEL = 3
+MAX_PARALLEL = 6
+
+DEFAULT_DELAY = 0.20
 DEFAULT_TIMEOUT = 45
-DEFAULT_DELAY = 1.0
+DEFAULT_RETRIES = 2
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -190,13 +206,16 @@ class PDFDownloadError(TIRDError):
     pass
 
 
+class CollectionStopped(TIRDError):
+    pass
+
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-@dataclass
+@dataclass(frozen=True)
 class Config:
-
     authorization: str
     cookie: str
     referer: str
@@ -204,21 +223,24 @@ class Config:
     curl_executable: str
     output: Path
 
-    timeout: int = DEFAULT_TIMEOUT
+    parallel: int = DEFAULT_PARALLEL
     delay: float = DEFAULT_DELAY
+    timeout: int = DEFAULT_TIMEOUT
+    retries: int = DEFAULT_RETRIES
 
     verbose: bool = False
     debug_response: bool = False
     skip_content_page: bool = False
+    verify_existing: bool = False
 
     @classmethod
     def load(cls, args: argparse.Namespace) -> "Config":
 
         env_path = PROJECT_DIR / ".env"
 
-        if not env_path.exists():
+        if not env_path.is_file():
             raise ConfigurationError(
-                f".env file not found: {env_path}"
+                f"Missing .env file: {env_path}"
             )
 
         load_dotenv(
@@ -228,12 +250,9 @@ class Config:
             interpolate=False,
         )
 
-        def read_env(
-            name: str,
-            default: str = "",
-        ) -> str:
+        def env(name: str) -> str:
 
-            value = os.getenv(name, default).strip()
+            value = os.getenv(name, "").strip()
 
             if (
                 len(value) >= 2
@@ -244,18 +263,9 @@ class Config:
 
             return value.strip()
 
-        authorization = read_env(
-            "TIRD_AUTHORIZATION"
-        )
-
-        cookie = read_env(
-            "TIRD_COOKIE"
-        )
-
-        referer = read_env(
-            "TIRD_REFERER",
-            f"{BASE_URL}/Content",
-        )
+        authorization = env("TIRD_AUTHORIZATION")
+        cookie = env("TIRD_COOKIE")
+        referer = env("TIRD_REFERER")
 
         if not authorization:
             raise ConfigurationError(
@@ -267,38 +277,52 @@ class Config:
                 "TIRD_COOKIE is missing from .env"
             )
 
-        if not referer.startswith(
-            f"{BASE_URL}/Content"
+        if not referer:
+            raise ConfigurationError(
+                "TIRD_REFERER is missing from .env"
+            )
+
+        parsed_referer = urlparse(referer)
+
+        if (
+            parsed_referer.scheme != "https"
+            or parsed_referer.netloc.lower()
+            != "tirdmember.tird.insure"
+            or parsed_referer.path != "/Content"
         ):
             raise ConfigurationError(
-                "TIRD_REFERER must point to the "
-                "authorized TIRD Content page."
+                "TIRD_REFERER must be the authorized "
+                "TIRD Content page URL."
             )
 
-        if "\n" in authorization or "\r" in authorization:
-            raise ConfigurationError(
-                "Invalid characters in TIRD_AUTHORIZATION."
-            )
+        for name, value in (
+            ("TIRD_AUTHORIZATION", authorization),
+            ("TIRD_COOKIE", cookie),
+            ("TIRD_REFERER", referer),
+        ):
+            if any(
+                char in value
+                for char in ("\r", "\n", "\x00")
+            ):
+                raise ConfigurationError(
+                    f"Invalid control character in {name}"
+                )
 
-        if "\n" in cookie or "\r" in cookie:
-            raise ConfigurationError(
-                "Invalid characters in TIRD_COOKIE."
-            )
-
-        if "\n" in referer or "\r" in referer:
-            raise ConfigurationError(
-                "Invalid characters in TIRD_REFERER."
-            )
-
-        curl_executable = shutil.which(
-            "curl.exe"
-        )
+        curl_executable = shutil.which("curl.exe")
 
         if not curl_executable:
             raise ConfigurationError(
-                "curl.exe was not found. "
-                "Install curl or ensure curl.exe is available "
-                "in the Windows PATH."
+                "curl.exe was not found in PATH."
+            )
+
+        if not 1 <= args.parallel <= MAX_PARALLEL:
+            raise ConfigurationError(
+                f"--parallel must be between 1 and {MAX_PARALLEL}"
+            )
+
+        if args.delay < 0:
+            raise ConfigurationError(
+                "--delay cannot be negative."
             )
 
         if args.timeout <= 0:
@@ -306,9 +330,9 @@ class Config:
                 "--timeout must be greater than zero."
             )
 
-        if args.delay < 0:
+        if not 0 <= args.retries <= 5:
             raise ConfigurationError(
-                "--delay cannot be negative."
+                "--retries must be between 0 and 5."
             )
 
         output = args.output.resolve()
@@ -324,16 +348,19 @@ class Config:
             referer=referer,
             curl_executable=curl_executable,
             output=output,
-            timeout=args.timeout,
+            parallel=args.parallel,
             delay=args.delay,
+            timeout=args.timeout,
+            retries=args.retries,
             verbose=args.verbose,
             debug_response=args.debug_response,
             skip_content_page=args.skip_content_page,
+            verify_existing=args.verify_existing,
         )
 
 
 # ============================================================
-# LOGGING
+# LOGGING AND DISPLAY
 # ============================================================
 
 def setup_logging(verbose: bool) -> None:
@@ -359,14 +386,12 @@ def show_header() -> None:
             Panel(
                 "[bold cyan]TIRD[/bold cyan]  "
                 "[bold white]NEWSLETTER COLLECTOR[/bold white]\n"
-                "[dim]CURL ENGINE  /  PDF ARCHIVE  /  MANIFEST[/dim]",
+                "[dim]CURL ENGINE  /  PARALLEL DOWNLOAD  /  PDF ARCHIVE[/dim]",
                 title=f"v{APP_VERSION}",
                 border_style="cyan",
                 padding=(1, 3),
             )
         )
-
-        console.print()
 
     else:
 
@@ -375,12 +400,14 @@ def show_header() -> None:
         print(APP_NAME)
         print(f"VERSION {APP_VERSION}")
         print("HTTP ENGINE: CURL")
+        print("DOWNLOAD ENGINE: PARALLEL")
         print("=" * 68)
 
 
 def show_summary(
     stats: dict[str, int],
     output: Path,
+    elapsed: float,
 ) -> None:
 
     if RICH_AVAILABLE:
@@ -408,6 +435,11 @@ def show_summary(
                 str(value),
             )
 
+        table.add_row(
+            "ELAPSED",
+            f"{elapsed:.2f} sec",
+        )
+
         console.print()
         console.print(table)
         console.print()
@@ -421,14 +453,16 @@ def show_summary(
         print("=" * 68)
 
         for key, value in stats.items():
-            print(f"{key:12}: {value}")
+            print(f"{key:14}: {value}")
 
-        print(f"Output      : {output}")
+        print(f"Elapsed       : {elapsed:.2f} sec")
+        print(f"Output        : {output}")
+
         print("=" * 68)
 
 
 # ============================================================
-# UTILITIES
+# COMMON UTILITIES
 # ============================================================
 
 def now_iso() -> str:
@@ -453,44 +487,63 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def valid_pdf(path: Path) -> bool:
+
+    try:
+
+        if not path.is_file():
+            return False
+
+        if path.stat().st_size < 5:
+            return False
+
+        with path.open("rb") as file:
+            return file.read(5) == b"%PDF-"
+
+    except OSError:
+        return False
+
+
 def safe_filename(
     value: str,
     max_stem_length: int = 110,
 ) -> str:
 
-    filename = str(value or "").strip()
+    value = str(value or "").strip()
 
-    filename = re.sub(
+    value = re.sub(
         r'[<>:"/\\|?*\x00-\x1f]',
         "_",
-        filename,
+        value,
     )
 
-    filename = re.sub(
+    value = re.sub(
         r"\s+",
         " ",
-        filename,
+        value,
     )
 
-    filename = filename.strip(" .")
+    value = value.strip(" .")
 
-    if filename.lower().endswith(".pdf"):
-        filename = filename[:-4]
+    if value.lower().endswith(".pdf"):
+        value = value[:-4]
 
-    filename = filename[:max_stem_length].rstrip(" .")
+    value = value[:max_stem_length].rstrip(" .")
 
-    if not filename:
-        filename = "document"
+    if not value:
+        value = "document"
 
-    if filename.upper() in {
+    if value.upper() in {
         "CON",
         "PRN",
         "AUX",
         "NUL",
+        "COM1",
+        "LPT1",
     }:
-        filename = "_" + filename
+        value = "_" + value
 
-    return filename + ".pdf"
+    return value + ".pdf"
 
 
 def parse_thai_date(
@@ -509,12 +562,8 @@ def parse_thai_date(
         return None
 
     day = int(match.group(1))
-    month_name = match.group(2)
+    month = THAI_MONTHS.get(match.group(2))
     year = int(match.group(3))
-
-    month = THAI_MONTHS.get(
-        month_name
-    )
 
     if month is None:
         return None
@@ -525,9 +574,9 @@ def parse_thai_date(
     try:
 
         return datetime(
-            year,
-            month,
-            day,
+            year=year,
+            month=month,
+            day=day,
         )
 
     except ValueError:
@@ -546,9 +595,7 @@ def parse_edition(
     return match.group(1) if match else ""
 
 
-def service_id_of(
-    service: dict,
-) -> str:
+def service_id_of(service: dict) -> str:
 
     return str(
         service.get("Service_id")
@@ -558,9 +605,7 @@ def service_id_of(
     ).strip()
 
 
-def service_title_of(
-    service: dict,
-) -> str:
+def service_title_of(service: dict) -> str:
 
     return str(
         service.get("Service_name")
@@ -570,9 +615,7 @@ def service_title_of(
     ).strip()
 
 
-def service_subtitle_of(
-    service: dict,
-) -> str:
+def service_subtitle_of(service: dict) -> str:
 
     return str(
         service.get("Service_Sub_Name")
@@ -581,28 +624,7 @@ def service_subtitle_of(
     )
 
 
-def valid_pdf(
-    path: Path,
-) -> bool:
-
-    try:
-
-        if not path.is_file():
-            return False
-
-        if path.stat().st_size < 5:
-            return False
-
-        with path.open("rb") as file:
-            return file.read(5) == b"%PDF-"
-
-    except OSError:
-        return False
-
-
-def decode_text(
-    content: bytes,
-) -> str:
+def decode_text(content: bytes) -> str:
 
     if not content:
         return ""
@@ -617,13 +639,9 @@ def decode_text(
         )
 
 
-def parse_json_bytes(
-    content: bytes,
-) -> Any:
+def parse_json_bytes(content: bytes) -> Any:
 
-    text = decode_text(
-        content
-    ).strip()
+    text = decode_text(content).strip()
 
     if not text:
         raise APIResponseError(
@@ -631,22 +649,15 @@ def parse_json_bytes(
         )
 
     if text.startswith(")]}'"):
-        text = text.split(
-            "\n",
-            1,
-        )[-1].strip()
+        text = text.split("\n", 1)[-1].strip()
 
     try:
-
-        result = json.loads(
-            text
-        )
+        result = json.loads(text)
 
     except json.JSONDecodeError as exc:
-
         raise APIResponseError(
             "Invalid JSON response: "
-            f"{exc.msg} at character {exc.pos}"
+            f"{exc.msg} at position {exc.pos}"
         ) from exc
 
     if isinstance(result, str):
@@ -685,9 +696,7 @@ def parse_content_disposition(
             errors="replace",
         )
 
-        return safe_filename(
-            filename
-        )
+        return safe_filename(filename)
 
     match = re.search(
         r'filename\s*=\s*"([^"]+)"',
@@ -696,7 +705,6 @@ def parse_content_disposition(
     )
 
     if not match:
-
         match = re.search(
             r"filename\s*=\s*([^;]+)",
             value,
@@ -704,7 +712,6 @@ def parse_content_disposition(
         )
 
     if match:
-
         return safe_filename(
             match.group(1).strip().strip('"')
         )
@@ -713,39 +720,93 @@ def parse_content_disposition(
 
 
 # ============================================================
-# CURL CONFIGURATION
+# SHARED RATE LIMITER
 # ============================================================
 
-def curl_quote(
-    value: str,
-) -> str:
-
+class RateLimiter:
     """
-    Quote a value for curl's configuration-file syntax.
+    Minimum time interval between request starts
+    across all worker threads.
 
-    Credentials are sent via curl --config - over stdin.
-    They do not appear in subprocess command-line arguments.
+    This limits aggregate request frequency,
+    not merely the number of concurrent workers.
     """
+
+    def __init__(self, interval: float):
+
+        self.interval = max(
+            0.0,
+            float(interval),
+        )
+
+        self._lock = threading.Lock()
+
+        self._next_allowed = 0.0
+
+    def wait(
+        self,
+        stop_event: threading.Event,
+    ) -> None:
+
+        if stop_event.is_set():
+            raise CollectionStopped(
+                "Collection stopped."
+            )
+
+        if self.interval <= 0:
+            return
+
+        with self._lock:
+
+            if stop_event.is_set():
+                raise CollectionStopped(
+                    "Collection stopped."
+                )
+
+            now = time.monotonic()
+
+            scheduled = max(
+                now,
+                self._next_allowed,
+            )
+
+            self._next_allowed = (
+                scheduled + self.interval
+            )
+
+            sleep_time = scheduled - now
+
+        if sleep_time > 0:
+
+            if stop_event.wait(sleep_time):
+                raise CollectionStopped(
+                    "Collection stopped."
+                )
+
+
+# ============================================================
+# CURL CONFIG HELPERS
+# ============================================================
+
+def curl_quote(value: str) -> str:
 
     value = str(value)
 
-    if "\x00" in value:
+    if any(
+        character in value
+        for character in ("\r", "\n", "\x00")
+    ):
         raise ConfigurationError(
-            "NUL characters are not allowed in curl options."
+            "Invalid control character in curl option."
         )
 
-    if "\r" in value or "\n" in value:
-        raise ConfigurationError(
-            "Newlines are not allowed in curl options."
-        )
-
-    escaped = (
+    value = (
         value
         .replace("\\", "\\\\")
         .replace('"', '\\"')
     )
 
-    return f'"{escaped}"'
+    return f'"{value}"'
 
 
 def curl_option(
@@ -763,7 +824,7 @@ def parse_header_file(
     path: Path,
 ) -> tuple[int, dict[str, str]]:
 
-    if not path.exists():
+    if not path.is_file():
         return 0, {}
 
     raw = path.read_bytes()
@@ -796,9 +857,7 @@ def parse_header_file(
         if not match:
             continue
 
-        status = int(
-            match.group(1)
-        )
+        status = int(match.group(1))
 
         headers: dict[str, str] = {}
 
@@ -830,16 +889,14 @@ class CurlResponse:
 
     status_code: int
     headers: dict[str, str]
-
     body_path: Path
-
     endpoint: str
     http_version: str = ""
 
     @property
     def body_size(self) -> int:
 
-        if not self.body_path.exists():
+        if not self.body_path.is_file():
             return 0
 
         return self.body_path.stat().st_size
@@ -886,13 +943,20 @@ class CurlTransport:
     def __init__(
         self,
         config: Config,
+        rate_limiter: RateLimiter | None = None,
+        stop_event: threading.Event | None = None,
     ):
 
         self.config = config
         self.curl = config.curl_executable
 
+        self.rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter(config.delay)
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
+
+        self._debug_lock = threading.Lock()
+
     # --------------------------------------------------------
-    # BUILD REQUEST CONFIG
+    # BUILD CURL CONFIG
     # --------------------------------------------------------
 
     def build_config(
@@ -902,11 +966,15 @@ class CurlTransport:
         authorization: bool,
     ) -> bytes:
 
-        url = BASE_URL + endpoint
-
         lines = [
-            curl_option("url", url),
-            curl_option("request", "POST"),
+            curl_option(
+                "url",
+                BASE_URL + endpoint,
+            ),
+            curl_option(
+                "request",
+                "POST",
+            ),
             "silent",
             "show-error",
             "globoff",
@@ -971,8 +1039,8 @@ class CurlTransport:
             ),
         ])
 
-        # Match the successful Chrome cURL request:
-        # POST GetService with Content-Length: 0.
+        # The successful Chrome GetService request
+        # uses an empty POST body and Content-Length: 0.
         if data is None:
 
             headers.append((
@@ -980,17 +1048,16 @@ class CurlTransport:
                 "0",
             ))
 
-        for key, value in headers:
+        for name, value in headers:
 
             lines.append(
                 curl_option(
                     "header",
-                    f"{key}: {value}",
+                    f"{name}: {value}",
                 )
             )
 
-        # Equivalent to curl -b "Cookie: values".
-        # The literal cookie string is preserved.
+        # Equivalent to curl -b with the complete cookie.
         lines.append(
             curl_option(
                 "cookie",
@@ -1000,8 +1067,6 @@ class CurlTransport:
 
         if data is not None:
 
-            # curl --data-urlencode:
-            # Content-Type: application/x-www-form-urlencoded
             for key, value in data.items():
 
                 lines.append(
@@ -1016,13 +1081,10 @@ class CurlTransport:
         ).encode("utf-8")
 
     # --------------------------------------------------------
-    # REDACT DIAGNOSTICS
+    # REDACT SECRETS
     # --------------------------------------------------------
 
-    def redact(
-        self,
-        text: str,
-    ) -> str:
+    def redact(self, text: str) -> str:
 
         result = str(text)
 
@@ -1048,7 +1110,7 @@ class CurlTransport:
         return result
 
     # --------------------------------------------------------
-    # SAVE SAFE DEBUG METADATA
+    # DEBUG METADATA
     # --------------------------------------------------------
 
     def save_debug(
@@ -1068,20 +1130,6 @@ class CurlTransport:
             exist_ok=True,
         )
 
-        name = response.endpoint.strip("/").replace(
-            "/",
-            "_",
-        )
-
-        date_suffix = datetime.now().strftime(
-            "%Y%m%d_%H%M%S_%f"
-        )
-
-        path = (
-            debug_dir
-            / f"{name}_{date_suffix}.json"
-        )
-
         body = response.read_bytes()
 
         metadata = {
@@ -1090,34 +1138,47 @@ class CurlTransport:
             "status_code": response.status_code,
             "http_version": response.http_version,
             "content_type": response.content_type,
-            "content_encoding": response.headers.get(
-                "content-encoding",
-            ),
-            "body_size": response.body_size,
+            "body_size": len(body),
             "body_sha256": hashlib.sha256(
                 body
             ).hexdigest(),
             "server": response.headers.get(
                 "server",
+                "",
             ),
             "cf_ray": response.headers.get(
                 "cf-ray",
+                "",
             ),
             "response_preview": self.redact(
-                decode_text(
-                    body[:200]
-                )
+                decode_text(body[:200])
             ),
         }
 
-        path.write_text(
-            json.dumps(
-                metadata,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        name = response.endpoint.strip("/").replace(
+            "/",
+            "_",
         )
+
+        with self._debug_lock:
+
+            suffix = datetime.now().strftime(
+                "%Y%m%d_%H%M%S_%f"
+            )
+
+            path = (
+                debug_dir
+                / f"{name}_{suffix}.json"
+            )
+
+            path.write_text(
+                json.dumps(
+                    metadata,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
 
         LOG.info(
             "Debug metadata saved: %s",
@@ -1125,7 +1186,7 @@ class CurlTransport:
         )
 
     # --------------------------------------------------------
-    # HTTP REQUEST
+    # EXECUTE HTTP REQUEST
     # --------------------------------------------------------
 
     @contextmanager
@@ -1137,12 +1198,23 @@ class CurlTransport:
         authorization: bool = True,
     ) -> Iterator[CurlResponse]:
 
+        self.rate_limiter.wait(
+            self.stop_event
+        )
+
+        if self.stop_event.is_set():
+            raise CollectionStopped(
+                "Collection stopped."
+            )
+
         with tempfile.TemporaryDirectory(
             prefix=".tird_http_",
             dir=self.config.output,
-        ) as temp_directory:
+        ) as temporary_directory:
 
-            temporary = Path(temp_directory)
+            temporary = Path(
+                temporary_directory
+            )
 
             body_path = (
                 temporary / "response.body"
@@ -1176,7 +1248,7 @@ class CurlTransport:
                 "--max-time",
                 str(self.config.timeout),
                 "--retry",
-                "2",
+                str(self.config.retries),
                 "--retry-delay",
                 "1",
             ]
@@ -1184,7 +1256,7 @@ class CurlTransport:
             if self.config.verbose:
 
                 LOG.debug(
-                    "CURL POST %s | form_fields=%s",
+                    "POST %s | fields=%s",
                     endpoint,
                     (
                         list(data.keys())
@@ -1192,6 +1264,12 @@ class CurlTransport:
                         else []
                     ),
                 )
+
+            process_timeout = (
+                self.config.timeout
+                * (self.config.retries + 1)
+                + 15
+            )
 
             try:
 
@@ -1201,14 +1279,14 @@ class CurlTransport:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     shell=False,
-                    timeout=self.config.timeout + 15,
+                    timeout=process_timeout,
                     check=False,
                 )
 
             except subprocess.TimeoutExpired as exc:
 
                 raise CurlError(
-                    f"CURL request timed out at {endpoint}"
+                    f"Request timed out at {endpoint}"
                 ) from exc
 
             except OSError as exc:
@@ -1232,16 +1310,16 @@ class CurlTransport:
             if completed.returncode != 0:
 
                 raise CurlError(
-                    f"CURL failed at {endpoint}. "
-                    f"Exit code: {completed.returncode}. "
-                    f"{stderr[:500]}"
+                    f"curl.exe failed at {endpoint}. "
+                    f"Exit={completed.returncode}. "
+                    f"{stderr[:400]}"
                 )
 
             status, headers = parse_header_file(
                 header_path
             )
 
-            metadata = {}
+            metadata: dict[str, str] = {}
 
             for line in stdout.splitlines():
 
@@ -1292,18 +1370,6 @@ class CurlTransport:
                     response.http_version or "?",
                 )
 
-                LOG.debug(
-                    "Server=%s | CF-Ray=%s",
-                    response.headers.get(
-                        "server",
-                        "-",
-                    ),
-                    response.headers.get(
-                        "cf-ray",
-                        "-",
-                    ),
-                )
-
             if response.status_code in (
                 301,
                 302,
@@ -1312,13 +1378,11 @@ class CurlTransport:
                 308,
             ):
 
-                self.save_debug(
-                    response
-                )
+                self.save_debug(response)
 
                 raise AuthenticationError(
-                    f"HTTP {response.status_code} at "
-                    f"{endpoint}: unexpected redirect."
+                    f"HTTP {response.status_code} "
+                    f"redirect at {endpoint}."
                 )
 
             if response.status_code in (
@@ -1326,39 +1390,29 @@ class CurlTransport:
                 403,
             ):
 
-                self.save_debug(
-                    response
-                )
+                self.save_debug(response)
 
                 raise AuthenticationError(
-                    f"HTTP {response.status_code} at "
-                    f"{endpoint}. "
-                    "The server rejected this request. "
-                    "Verify the authorized browser session "
-                    "and its current credentials."
+                    f"HTTP {response.status_code} "
+                    f"at {endpoint}. "
+                    "Authentication or access rejected."
                 )
 
-            if response.status_code < 200 or response.status_code >= 300:
+            if not 200 <= response.status_code < 300:
 
-                self.save_debug(
-                    response
-                )
+                self.save_debug(response)
 
                 raise CurlError(
-                    f"HTTP {response.status_code} at "
-                    f"{endpoint}"
+                    f"HTTP {response.status_code} "
+                    f"at {endpoint}"
                 )
 
             if response.body_size == 0:
 
-                self.save_debug(
-                    response
-                )
+                self.save_debug(response)
 
                 raise APIResponseError(
-                    f"{endpoint} returned HTTP "
-                    f"{response.status_code} "
-                    "with an empty response body."
+                    f"{endpoint} returned an empty body."
                 )
 
             yield response
@@ -1373,16 +1427,25 @@ class TIRDClient:
     def __init__(
         self,
         config: Config,
+        stop_event: threading.Event | None = None,
     ):
 
         self.config = config
 
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
+
+        self.rate_limiter = RateLimiter(
+            config.delay
+        )
+
         self.transport = CurlTransport(
-            config
+            config=config,
+            rate_limiter=self.rate_limiter,
+            stop_event=self.stop_event,
         )
 
     # --------------------------------------------------------
-    # JSON
+    # JSON REQUEST
     # --------------------------------------------------------
 
     def post_json(
@@ -1398,7 +1461,7 @@ class TIRDClient:
 
             try:
 
-                result = response.json()
+                return response.json()
 
             except APIResponseError:
 
@@ -1415,10 +1478,8 @@ class TIRDClient:
 
                 raise
 
-            return result
-
     # --------------------------------------------------------
-    # GET SERVICE CATALOG
+    # CATALOG
     # --------------------------------------------------------
 
     def get_services(self) -> list[dict]:
@@ -1449,9 +1510,7 @@ class TIRDClient:
                 "Items",
             ):
 
-                value = result.get(
-                    key
-                )
+                value = result.get(key)
 
                 if isinstance(value, list):
 
@@ -1477,8 +1536,7 @@ class TIRDClient:
         if services is None:
 
             raise APIResponseError(
-                "Unexpected JSON structure "
-                "from /Content/GetService."
+                "Unexpected GetService response structure."
             )
 
         accessible = []
@@ -1503,9 +1561,7 @@ class TIRDClient:
             ) is False:
                 continue
 
-            accessible.append(
-                service
-            )
+            accessible.append(service)
 
         LOG.info(
             "Catalog records: %s",
@@ -1520,7 +1576,7 @@ class TIRDClient:
         return accessible
 
     # --------------------------------------------------------
-    # GET SERVICE DETAILS
+    # SERVICE DETAILS
     # --------------------------------------------------------
 
     def get_service_detail(
@@ -1561,22 +1617,21 @@ class TIRDClient:
 
         if not service_key:
 
-            for key in (
+            for name in (
                 "data",
                 "Data",
                 "result",
                 "Result",
             ):
 
-                nested = detail.get(
-                    key
-                )
+                nested = detail.get(name)
 
                 if isinstance(nested, dict):
 
                     service_key = (
                         nested.get("workspace_id")
                         or nested.get("Workspace_Id")
+                        or nested.get("Workspace_id")
                     )
 
                     if service_key:
@@ -1585,16 +1640,14 @@ class TIRDClient:
         if not service_key:
 
             raise APIResponseError(
-                "workspace_id is missing "
-                f"for Service_Id={service_id}"
+                "workspace_id not found for "
+                f"Service_Id={service_id}"
             )
 
-        return str(
-            service_key
-        )
+        return str(service_key)
 
     # --------------------------------------------------------
-    # SHOW CONTENT
+    # CONTENT PAGE
     # --------------------------------------------------------
 
     def show_content(
@@ -1623,7 +1676,7 @@ class TIRDClient:
                 )
 
     # --------------------------------------------------------
-    # DOWNLOAD PDF
+    # PDF DOWNLOAD
     # --------------------------------------------------------
 
     def download_pdf(
@@ -1633,6 +1686,11 @@ class TIRDClient:
         output_dir: Path,
         preferred_filename: str,
     ) -> tuple[Path, int, str]:
+
+        if self.stop_event.is_set():
+            raise CollectionStopped(
+                "Collection stopped."
+            )
 
         output_dir.mkdir(
             parents=True,
@@ -1667,9 +1725,7 @@ class TIRDClient:
                 )
 
                 raise PDFDownloadError(
-                    "ListFiles returned a response "
-                    "that is not a valid PDF. "
-                    f"HTTP={response.status_code}; "
+                    "ListFiles did not return a valid PDF. "
                     f"Content-Type={response.content_type}; "
                     f"Bytes={response.body_size}"
                 )
@@ -1685,70 +1741,79 @@ class TIRDClient:
                 service_id.encode("utf-8")
             ).hexdigest()[:12]
 
-            stem = Path(
-                filename
-            ).stem
-
             final_filename = safe_filename(
-                f"{stem[:105]}_{unique_suffix}.pdf"
+                f"{Path(filename).stem[:105]}_"
+                f"{unique_suffix}.pdf"
             )
 
             destination = (
                 output_dir / final_filename
             )
 
-            source_size = (
-                response.body_size
-            )
+            source_size = response.body_size
 
-            expected_size = response.headers.get(
+            expected_header = response.headers.get(
                 "content-length",
                 "",
             )
 
-            if expected_size:
+            if expected_header:
 
                 try:
 
-                    expected = int(
-                        expected_size
+                    expected_size = int(
+                        expected_header
                     )
 
                 except ValueError:
 
-                    expected = None
+                    expected_size = None
 
                 if (
-                    expected is not None
-                    and expected != source_size
+                    expected_size is not None
+                    and expected_size != source_size
                 ):
 
                     raise PDFDownloadError(
                         "Incomplete PDF response. "
-                        f"Expected {expected} bytes, "
-                        f"received {source_size} bytes."
+                        f"Expected={expected_size}; "
+                        f"Received={source_size}"
                     )
 
             checksum = sha256_file(
                 response.body_path
             )
 
-            temporary_destination = (
-                output_dir
-                / f".{unique_suffix}.part"
-            )
+            # Unique temporary name prevents collisions
+            # between concurrent download workers.
+            temporary_path: Path | None = None
 
             try:
 
-                # Copy to the destination filesystem first.
-                # Then atomically replace the final file.
-                shutil.copyfile(
-                    response.body_path,
-                    temporary_destination,
-                )
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=".tird_pdf_",
+                    suffix=".part",
+                    dir=output_dir,
+                    delete=False,
+                ) as temporary_file:
+
+                    temporary_path = Path(
+                        temporary_file.name
+                    )
+
+                    with response.body_path.open(
+                        "rb"
+                    ) as source:
+
+                        shutil.copyfileobj(
+                            source,
+                            temporary_file,
+                            length=1024 * 1024,
+                        )
 
                 if not valid_pdf(
-                    temporary_destination
+                    temporary_path
                 ):
 
                     raise PDFDownloadError(
@@ -1756,7 +1821,7 @@ class TIRDClient:
                     )
 
                 if (
-                    temporary_destination.stat().st_size
+                    temporary_path.stat().st_size
                     != source_size
                 ):
 
@@ -1764,16 +1829,26 @@ class TIRDClient:
                         "PDF copy size mismatch."
                     )
 
+                if sha256_file(temporary_path) != checksum:
+
+                    raise PDFDownloadError(
+                        "PDF SHA256 mismatch."
+                    )
+
                 os.replace(
-                    temporary_destination,
+                    temporary_path,
                     destination,
                 )
 
+                temporary_path = None
+
             finally:
 
-                temporary_destination.unlink(
-                    missing_ok=True
-                )
+                if temporary_path is not None:
+
+                    temporary_path.unlink(
+                        missing_ok=True
+                    )
 
             return (
                 destination,
@@ -1788,9 +1863,15 @@ class TIRDClient:
 
 class Manifest:
 
+    """
+    Manifest is only modified by the main thread.
+    Worker threads return results without writing CSV.
+    """
+
     def __init__(
         self,
         output: Path,
+        verify_existing: bool = False,
     ):
 
         self.output = output.resolve()
@@ -1799,13 +1880,15 @@ class Manifest:
             self.output / "manifest.csv"
         )
 
+        self.verify_existing = verify_existing
+
         self.records: dict[str, dict] = {}
 
         self.load()
 
     def load(self) -> None:
 
-        if not self.path.exists():
+        if not self.path.is_file():
             return
 
         with self.path.open(
@@ -1814,20 +1897,18 @@ class Manifest:
             newline="",
         ) as file:
 
-            reader = csv.DictReader(
-                file
-            )
+            reader = csv.DictReader(file)
 
-            for row in reader:
+            for record in reader:
 
-                service_id = row.get(
+                service_id = record.get(
                     "service_id",
                     "",
                 )
 
                 if service_id:
 
-                    self.records[service_id] = row
+                    self.records[service_id] = record
 
     def get(
         self,
@@ -1843,9 +1924,7 @@ class Manifest:
         service_id: str,
     ) -> bool:
 
-        record = self.get(
-            service_id
-        )
+        record = self.get(service_id)
 
         if not record:
             return False
@@ -1855,26 +1934,22 @@ class Manifest:
         ) != "success":
             return False
 
-        relative_path = record.get(
+        relative = record.get(
             "file_path",
             "",
         )
 
-        if not relative_path:
+        if not relative:
             return False
 
         path = (
-            self.output / relative_path
+            self.output / relative
         ).resolve()
 
-        if not path.is_relative_to(
-            self.output
-        ):
+        if not path.is_relative_to(self.output):
             return False
 
-        if not valid_pdf(
-            path
-        ):
+        if not valid_pdf(path):
             return False
 
         expected_size = (
@@ -1886,13 +1961,26 @@ class Manifest:
 
             try:
 
-                if path.stat().st_size != int(
-                    expected_size
+                if (
+                    path.stat().st_size
+                    != int(expected_size)
                 ):
                     return False
 
             except ValueError:
                 return False
+
+        if self.verify_existing:
+
+            expected_hash = record.get(
+                "sha256",
+                "",
+            )
+
+            if expected_hash:
+
+                if sha256_file(path) != expected_hash:
+                    return False
 
         return True
 
@@ -1901,9 +1989,7 @@ class Manifest:
         record: dict,
     ) -> None:
 
-        service_id = record[
-            "service_id"
-        ]
+        service_id = record["service_id"]
 
         self.records[service_id] = {
             column: record.get(
@@ -1922,52 +2008,92 @@ class Manifest:
             exist_ok=True,
         )
 
-        temporary = self.path.with_suffix(
-            ".csv.tmp"
-        )
+        temporary: Path | None = None
 
-        with temporary.open(
-            "w",
-            encoding="utf-8-sig",
-            newline="",
-        ) as file:
+        try:
 
-            writer = csv.DictWriter(
-                file,
-                fieldnames=MANIFEST_COLUMNS,
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8-sig",
+                newline="",
+                prefix=".tird_manifest_",
+                suffix=".tmp",
+                dir=self.output,
+                delete=False,
+            ) as file:
+
+                temporary = Path(file.name)
+
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=MANIFEST_COLUMNS,
+                )
+
+                writer.writeheader()
+
+                writer.writerows(
+                    self.records.values()
+                )
+
+            os.replace(
+                temporary,
+                self.path,
             )
 
-            writer.writeheader()
+            temporary = None
 
-            writer.writerows(
-                self.records.values()
-            )
+        finally:
 
-        os.replace(
-            temporary,
-            self.path,
-        )
+            if temporary is not None:
+
+                temporary.unlink(
+                    missing_ok=True
+                )
 
 
 # ============================================================
-# COLLECTOR
+# DOCUMENT RESULT
+# ============================================================
+
+@dataclass
+class DownloadResult:
+
+    service_id: str
+    title: str
+    status: str
+
+    record: dict | None = None
+
+    error: str = ""
+    size: int = 0
+    elapsed: float = 0.0
+
+
+# ============================================================
+# PARALLEL COLLECTOR
 # ============================================================
 
 class TIRDCollector:
 
     def __init__(
         self,
-        client: TIRDClient,
         config: Config,
         force: bool = False,
     ):
 
-        self.client = client
         self.config = config
         self.force = force
 
+        self.stop_event = threading.Event()
+
+        self.client = TIRDClient(
+            config=config,
+            stop_event=self.stop_event,
+        )
+
         self.manifest = Manifest(
-            config.output
+            config.output,
+            verify_existing=config.verify_existing,
         )
 
         self.stats = {
@@ -2019,20 +2145,17 @@ class TIRDCollector:
         if not services:
 
             LOG.warning(
-                "Authentication succeeded, "
-                "but no accessible documents were returned."
+                "No accessible documents in catalog."
             )
 
             return True
 
-        sample = services[0]
-
-        service_id = service_id_of(
-            sample
-        )
-
         LOG.info(
             "Testing GetServiceById"
+        )
+
+        service_id = service_id_of(
+            services[0]
         )
 
         service_key = self.client.get_service_key(
@@ -2070,13 +2193,13 @@ class TIRDCollector:
         else:
 
             print()
-            print("=" * 55)
+            print("=" * 56)
             print("API CONNECTION SUCCESSFUL")
             print(f"Catalog: {len(services)} documents")
             print("GetService: PASS")
             print("GetServiceById: PASS")
             print("PDF download: NOT TESTED")
-            print("=" * 55)
+            print("=" * 56)
 
         return True
 
@@ -2119,10 +2242,19 @@ class TIRDCollector:
                 style="green",
             )
 
+            table.add_column(
+                "Local",
+                justify="center",
+            )
+
             for index, service in enumerate(
                 services,
                 1,
             ):
+
+                service_id = service_id_of(
+                    service
+                )
 
                 subtitle = service_subtitle_of(
                     service
@@ -2130,6 +2262,10 @@ class TIRDCollector:
 
                 published = parse_thai_date(
                     subtitle
+                )
+
+                completed = self.manifest.completed(
+                    service_id
                 )
 
                 table.add_row(
@@ -2141,80 +2277,63 @@ class TIRDCollector:
                         if published
                         else "-"
                     ),
+                    (
+                        "[green]Saved[/green]"
+                        if completed
+                        else "[dim]-[/dim]"
+                    ),
                 )
 
             console.print(table)
 
             console.print(
-                f"\n[dim]Total documents: "
-                f"{len(services)}[/dim]"
+                f"\n[dim]Total: {len(services)} documents[/dim]"
             )
 
         else:
 
             print()
-            print("=" * 68)
 
             for index, service in enumerate(
                 services,
                 1,
             ):
 
+                status = (
+                    "SAVED"
+                    if self.manifest.completed(
+                        service_id_of(service)
+                    )
+                    else "NEW"
+                )
+
                 print(
-                    f"{index:03d} | "
+                    f"{index:03d} | {status:5} | "
                     f"{service_title_of(service)}"
                 )
 
-            print("=" * 68)
-
             print(
-                f"Total: {len(services)}"
+                f"\nTotal: {len(services)}"
             )
 
     # --------------------------------------------------------
-    # DOWNLOAD ONE
+    # CREATE MANIFEST RECORD
     # --------------------------------------------------------
 
-    def process_service(
+    def build_record(
         self,
         service: dict,
-    ) -> None:
+    ) -> tuple[dict, Path, str]:
 
-        service_id = service_id_of(
-            service
-        )
+        service_id = service_id_of(service)
 
-        title = service_title_of(
-            service
-        )
+        title = service_title_of(service)
 
-        subtitle = service_subtitle_of(
-            service
-        )
+        subtitle = service_subtitle_of(service)
 
-        edition = parse_edition(
-            subtitle
-        )
+        edition = parse_edition(subtitle)
 
-        published = parse_thai_date(
-            subtitle
-        )
-
-        if (
-            not self.force
-            and self.manifest.completed(
-                service_id
-            )
-        ):
-
-            self.stats["skipped"] += 1
-
-            LOG.info(
-                "SKIP | %s",
-                title,
-            )
-
-            return
+        published = parse_thai_date(subtitle)
 
         if published:
 
@@ -2224,21 +2343,16 @@ class TIRDCollector:
                 / f"{published.month:02d}"
             )
 
-            published_date = (
-                published.strftime(
-                    "%Y-%m-%d"
-                )
+            published_date = published.strftime(
+                "%Y-%m-%d"
             )
 
-            year = str(
-                published.year
-            )
+            year = str(published.year)
 
         else:
 
             output_dir = (
-                self.config.output
-                / "unknown_date"
+                self.config.output / "unknown_date"
             )
 
             published_date = ""
@@ -2263,6 +2377,39 @@ class TIRDCollector:
             "downloaded_at": now_iso(),
             "error": "",
         }
+
+        return (
+            record,
+            output_dir,
+            preferred_filename,
+        )
+
+    # --------------------------------------------------------
+    # WORKER
+    # --------------------------------------------------------
+
+    def download_worker(
+        self,
+        service: dict,
+    ) -> DownloadResult:
+
+        started = time.monotonic()
+
+        service_id = service_id_of(service)
+
+        title = service_title_of(service)
+
+        if self.stop_event.is_set():
+
+            return DownloadResult(
+                service_id=service_id,
+                title=title,
+                status="cancelled",
+            )
+
+        record, output_dir, preferred_filename = (
+            self.build_record(service)
+        )
 
         try:
 
@@ -2291,20 +2438,28 @@ class TIRDCollector:
                 "error": "",
             })
 
-            self.manifest.upsert(
-                record
-            )
-
-            self.stats["downloaded"] += 1
-
-            LOG.info(
-                "SUCCESS | %.2f MB | %s",
-                size / (1024 * 1024),
-                destination.name,
+            return DownloadResult(
+                service_id=service_id,
+                title=title,
+                status="success",
+                record=record,
+                size=size,
+                elapsed=time.monotonic() - started,
             )
 
         except AuthenticationError:
+
+            self.stop_event.set()
             raise
+
+        except CollectionStopped:
+
+            return DownloadResult(
+                service_id=service_id,
+                title=title,
+                status="cancelled",
+                elapsed=time.monotonic() - started,
+            )
 
         except (
             CurlError,
@@ -2314,34 +2469,77 @@ class TIRDCollector:
             ValueError,
         ) as exc:
 
-            record["error"] = str(
-                exc
+            record["status"] = "failed"
+            record["error"] = str(exc)
+            record["downloaded_at"] = now_iso()
+
+            return DownloadResult(
+                service_id=service_id,
+                title=title,
+                status="failed",
+                record=record,
+                error=str(exc),
+                elapsed=time.monotonic() - started,
             )
 
-            record["downloaded_at"] = (
-                now_iso()
+    # --------------------------------------------------------
+    # PROCESS RESULT
+    # --------------------------------------------------------
+
+    def process_result(
+        self,
+        result: DownloadResult,
+    ) -> None:
+
+        if result.status == "success":
+
+            if result.record is not None:
+
+                self.manifest.upsert(
+                    result.record
+                )
+
+            self.stats["downloaded"] += 1
+
+            LOG.info(
+                "SUCCESS | %.2f MB | %.2fs | %s",
+                result.size / (1024 * 1024),
+                result.elapsed,
+                result.title,
             )
 
-            # Preserve the last successful record if
-            # a forced redownload was unsuccessful.
-            if not self.manifest.completed(
-                service_id
+        elif result.status == "failed":
+
+            # Preserve the previous successful manifest
+            # if a forced redownload has failed.
+            if (
+                result.record is not None
+                and not self.manifest.completed(
+                    result.service_id
+                )
             ):
 
                 self.manifest.upsert(
-                    record
+                    result.record
                 )
 
             self.stats["failed"] += 1
 
             LOG.error(
                 "FAILED | %s | %s",
-                title,
-                exc,
+                result.title,
+                result.error,
+            )
+
+        elif result.status == "cancelled":
+
+            LOG.warning(
+                "CANCELLED | %s",
+                result.title,
             )
 
     # --------------------------------------------------------
-    # DOWNLOAD SELECTED
+    # COLLECT IN PARALLEL
     # --------------------------------------------------------
 
     def collect(
@@ -2349,96 +2547,91 @@ class TIRDCollector:
         services: list[dict],
     ) -> int:
 
-        self.stats["total"] = len(
-            services
-        )
+        started = time.monotonic()
 
-        LOG.info(
-            "Starting collection: %s documents",
-            len(services),
-        )
+        self.stats["total"] = len(services)
 
-        if RICH_AVAILABLE:
+        pending_services = []
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn(
-                    "[cyan]{task.description}"
-                ),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeElapsedColumn(),
-                console=console,
-            ) as progress:
+        for service in services:
 
-                task = progress.add_task(
-                    "Downloading newsletters",
-                    total=len(services),
+            service_id = service_id_of(
+                service
+            )
+
+            if (
+                not self.force
+                and self.manifest.completed(
+                    service_id
                 )
-
-                for index, service in enumerate(
-                    services
-                ):
-
-                    progress.update(
-                        task,
-                        description=(
-                            f"Processing "
-                            f"{index + 1}/{len(services)}"
-                        ),
-                    )
-
-                    try:
-
-                        self.process_service(
-                            service
-                        )
-
-                    finally:
-
-                        progress.advance(
-                            task
-                        )
-
-                    if (
-                        index < len(services) - 1
-                        and self.config.delay > 0
-                    ):
-
-                        time.sleep(
-                            self.config.delay
-                        )
-
-        else:
-
-            for index, service in enumerate(
-                services,
-                1,
             ):
 
+                self.stats["skipped"] += 1
+
                 LOG.info(
-                    "[%s/%s] %s",
-                    index,
-                    len(services),
+                    "SKIP | %s",
                     service_title_of(service),
                 )
 
-                self.process_service(
+            else:
+
+                pending_services.append(
                     service
                 )
 
-                if (
-                    index < len(services)
-                    and self.config.delay > 0
-                ):
+        LOG.info(
+            "Total documents: %s",
+            len(services),
+        )
 
-                    time.sleep(
-                        self.config.delay
-                    )
+        LOG.info(
+            "Already completed: %s",
+            self.stats["skipped"],
+        )
+
+        LOG.info(
+            "Pending downloads: %s",
+            len(pending_services),
+        )
+
+        LOG.info(
+            "Parallel workers: %s",
+            self.config.parallel,
+        )
+
+        LOG.info(
+            "Request interval: %.2fs",
+            self.config.delay,
+        )
+
+        if not pending_services:
+
+            show_summary(
+                self.stats,
+                self.config.output,
+                time.monotonic() - started,
+            )
+
+            return 0
+
+        if RICH_AVAILABLE:
+
+            self._collect_with_rich(
+                pending_services
+            )
+
+        else:
+
+            self._collect_without_rich(
+                pending_services
+            )
+
+        elapsed = time.monotonic() - started
 
         show_summary(
             self.stats,
             self.config.output,
+            elapsed,
         )
 
         return (
@@ -2446,9 +2639,163 @@ class TIRDCollector:
             else 1
         )
 
+    # --------------------------------------------------------
+    # PARALLEL - RICH
+    # --------------------------------------------------------
+
+    def _collect_with_rich(
+        self,
+        services: list[dict],
+    ) -> None:
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn(
+                "[cyan]{task.description}"
+            ),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+
+            task = progress.add_task(
+                "Downloading newsletters",
+                total=len(services),
+            )
+
+            self._execute_workers(
+                services=services,
+                progress=progress,
+                task_id=task,
+            )
+
+    # --------------------------------------------------------
+    # PARALLEL - BASIC
+    # --------------------------------------------------------
+
+    def _collect_without_rich(
+        self,
+        services: list[dict],
+    ) -> None:
+
+        self._execute_workers(
+            services=services,
+            progress=None,
+            task_id=None,
+        )
+
+    # --------------------------------------------------------
+    # EXECUTOR
+    # --------------------------------------------------------
+
+    def _execute_workers(
+        self,
+        services: list[dict],
+        progress: Any,
+        task_id: Any,
+    ) -> None:
+
+        futures: dict[Future, dict] = {}
+
+        first_error: AuthenticationError | None = None
+
+        # The executor is responsible only for network and
+        # filesystem work. All manifest updates occur here
+        # in the main thread.
+        with ThreadPoolExecutor(
+            max_workers=self.config.parallel,
+            thread_name_prefix="TIRD",
+        ) as executor:
+
+            for service in services:
+
+                future = executor.submit(
+                    self.download_worker,
+                    service,
+                )
+
+                futures[future] = service
+
+            completed_count = 0
+
+            try:
+
+                for future in as_completed(futures):
+
+                    service = futures[future]
+
+                    completed_count += 1
+
+                    try:
+
+                        result = future.result()
+
+                    except AuthenticationError as exc:
+
+                        first_error = exc
+
+                        self.stop_event.set()
+
+                        for pending_future in futures:
+                            pending_future.cancel()
+
+                        break
+
+                    except Exception as exc:
+
+                        # Unexpected worker failures should not
+                        # crash the entire collector.
+                        result = DownloadResult(
+                            service_id=service_id_of(service),
+                            title=service_title_of(service),
+                            status="failed",
+                            error=(
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        )
+
+                    self.process_result(
+                        result
+                    )
+
+                    if progress is not None:
+
+                        progress.advance(
+                            task_id
+                        )
+
+                        progress.update(
+                            task_id,
+                            description=(
+                                f"Processed "
+                                f"{completed_count}/{len(services)}"
+                            ),
+                        )
+
+                    else:
+
+                        LOG.info(
+                            "Progress: %s/%s",
+                            completed_count,
+                            len(services),
+                        )
+
+            except KeyboardInterrupt:
+
+                self.stop_event.set()
+
+                for future in futures:
+                    future.cancel()
+
+                raise
+
+        if first_error is not None:
+            raise first_error
+
 
 # ============================================================
-# CLI ARGUMENTS
+# CLI
 # ============================================================
 
 def parse_args() -> argparse.Namespace:
@@ -2459,89 +2806,184 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--ui", action="store_true", help="Launch Textual terminal UI")
-
-    parser.add_argument("--headless", action="store_true", help="Download all without terminal UI")
-
     parser.add_argument(
         "--test-only",
         action="store_true",
-        help="Test catalog and service-detail API access",
+        help="Test GetService and GetServiceById",
     )
 
     parser.add_argument(
         "--list",
         action="store_true",
-        help="List available newsletter documents",
+        help="Display the newsletter catalog",
     )
 
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Maximum number of documents to process",
+        help="Maximum number of documents",
     )
 
     parser.add_argument(
         "--year",
         type=int,
         default=None,
-        help="Filter by publication year (2026 or 2569)",
+        help="Filter publication year (2026 or 2569)",
     )
 
     parser.add_argument(
         "--service-id",
         type=str,
         default=None,
-        help="Process a specific service ID",
+        help="Download one specific service ID",
     )
 
     parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_OUTPUT,
-        help="Destination directory",
+        "--scope",
+        choices=("both", "advisor", "insights"),
+        default="both",
+        help="Catalog section to list or download",
     )
 
     parser.add_argument(
-        "--force",
+        "--headless",
         action="store_true",
-        help="Redownload previously completed documents",
+        help="Run downloads in CLI mode instead of Textual",
+    )
+
+    parser.add_argument(
+        "--diagnose-scopes",
+        action="store_true",
+        help="Test Advisor -> Insights -> Advisor catalog routing (no PDFs)",
+    )
+
+    parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="Launch Textual interface",
+    )
+
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=DEFAULT_PARALLEL,
+        help="Maximum concurrent download workers",
     )
 
     parser.add_argument(
         "--delay",
         type=float,
         default=DEFAULT_DELAY,
-        help="Delay between document downloads",
+        help="Minimum interval between HTTP request starts",
     )
 
     parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_TIMEOUT,
-        help="HTTP timeout in seconds",
+        help="Maximum seconds per HTTP transfer attempt",
     )
 
     parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show safe HTTP diagnostics",
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="Retries for transient curl HTTP errors",
     )
 
     parser.add_argument(
-        "--debug-response",
+        "--output",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        help="Output directory",
+    )
+
+    parser.add_argument(
+        "--force",
         action="store_true",
-        help="Save non-sensitive response metadata on failures",
+        help="Redownload completed documents",
+    )
+
+    parser.add_argument(
+        "--verify-existing",
+        action="store_true",
+        help="Verify SHA256 of existing PDFs",
     )
 
     parser.add_argument(
         "--skip-content-page",
         action="store_true",
-        help="Skip ShowContentFiles before downloading",
+        help="Skip ShowContentFiles request",
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show non-sensitive HTTP diagnostics",
+    )
+
+    parser.add_argument(
+        "--debug-response",
+        action="store_true",
+        help="Save safe response metadata on failure",
     )
 
     return parser.parse_args()
+
+
+# ============================================================
+# FILTER SERVICES
+# ============================================================
+
+def filter_services(
+    services: list[dict],
+    args: argparse.Namespace,
+) -> list[dict]:
+
+    result = services
+
+    if args.service_id:
+
+        result = [
+            service
+            for service in result
+            if service_id_of(service)
+            == args.service_id
+        ]
+
+    if args.year is not None:
+
+        target_year = (
+            args.year - 543
+            if args.year >= 2400
+            else args.year
+        )
+
+        filtered = []
+
+        for service in result:
+
+            published = parse_thai_date(
+                service_subtitle_of(service)
+            )
+
+            if (
+                published is not None
+                and published.year == target_year
+            ):
+
+                filtered.append(
+                    service
+                )
+
+        result = filtered
+
+    if args.limit is not None:
+
+        result = result[:args.limit]
+
+    return result
 
 
 # ============================================================
@@ -2549,246 +2991,101 @@ def parse_args() -> argparse.Namespace:
 # ============================================================
 
 def main() -> int:
-
     args = parse_args()
+    setup_logging(args.verbose)
+    if args.limit is not None and args.limit <= 0:
+        LOG.error("--limit must be greater than zero")
+        return 2
+    if not (1 <= args.parallel <= MAX_PARALLEL):
+        LOG.error("--parallel must be between 1 and %s", MAX_PARALLEL)
+        return 2
+    if args.delay < 0:
+        LOG.error("--delay must be >= 0")
+        return 2
 
-    # Keep --test-only and the original CLI flags fully compatible.
-    # The no-flag command opens the interactive Textual dashboard.
-    cli_selected = (
-        args.headless or args.test_only or args.list
-        or args.limit is not None or args.year is not None
-        or args.service_id is not None
+    # Load only local .env; no credentials are placed in Git or the UI log.
+    try:
+        config = Config.load(args)
+        from tird_scopes import configured_scopes, collect_catalogs, filter_documents, ParallelArchive
+        scopes = configured_scopes(config, args.scope)
+    except (ConfigurationError, ValueError, OSError) as exc:
+        LOG.error("CONFIGURATION ERROR: %s", exc)
+        return 2
+
+    interactive = args.ui or not (
+        args.test_only or args.list or args.headless or args.diagnose_scopes
     )
-    if args.ui or not cli_selected:
+    if interactive:
         try:
             from tird_ui import run_app
+            return run_app(args, sys.modules[__name__])
         except ImportError as exc:
-            print(
-                "Terminal UI requires: python -m pip install -r requirements.txt",
-                file=sys.stderr,
-            )
+            LOG.error("UI dependencies missing: %s; pip install -r requirements.txt", exc)
             return 2
-        return run_app(args, sys.modules[__name__])
-
-    setup_logging(
-        args.verbose
-    )
 
     show_header()
-
-    if args.limit is not None and args.limit <= 0:
-
-        LOG.error(
-            "--limit must be greater than zero."
-        )
-
-        return 2
-
     try:
-
-        config = Config.load(
-            args
-        )
-
-    except (
-        ConfigurationError,
-        OSError,
-    ) as exc:
-
-        LOG.error(
-            "Configuration error: %s",
-            exc,
-        )
-
-        return 2
-
-    client = TIRDClient(
-        config
-    )
-
-    collector = TIRDCollector(
-        client=client,
-        config=config,
-        force=args.force,
-    )
-
-    try:
-
-        # ----------------------------------------------------
-        # TEST
-        # ----------------------------------------------------
-
-        if args.test_only:
-
-            return (
-                0 if collector.test_connection()
-                else 1
-            )
-
-        # ----------------------------------------------------
-        # CATALOG
-        # ----------------------------------------------------
-
-        services = client.get_services()
-
-        # ----------------------------------------------------
-        # SERVICE ID FILTER
-        # ----------------------------------------------------
-
-        if args.service_id:
-
-            services = [
-                service
-                for service in services
-                if service_id_of(service)
-                == args.service_id
-            ]
-
-        # ----------------------------------------------------
-        # YEAR FILTER
-        # ----------------------------------------------------
-
-        if args.year is not None:
-
-            target_year = (
-                args.year - 543
-                if args.year >= 2400
-                else args.year
-            )
-
-            filtered = []
-
-            for service in services:
-
-                published = parse_thai_date(
-                    service_subtitle_of(service)
+        if args.diagnose_scopes:
+            from tird_scopes import diagnose_scope_routing
+            report = diagnose_scope_routing(scopes)
+            print("TIRD A/B/A ROUTING DIAGNOSTIC")
+            print(f"Advisor first:   {report.advisor_first} documents")
+            print(f"Insights:        {report.insights} documents")
+            print(f"Advisor repeat:  {report.advisor_repeat} documents")
+            print(f"Overlap:         {report.overlap} Service IDs")
+            print(f"Advisor stable:  {report.advisor_stable}")
+            print(f"Distinct:        {report.distinct}")
+            print(f"Shared session:  {report.shared_credentials}")
+            print(
+                "Result:          " + (
+                    "PASS (referer routing consistent)"
+                    if report.consistent else
+                    "FAIL (verify menu URLs and server-side session context)"
                 )
+            )
+            print("PDF download:   NOT TESTED")
+            return 0 if report.consistent else 1
 
-                if (
-                    published is not None
-                    and published.year == target_year
-                ):
-
-                    filtered.append(
-                        service
-                    )
-
-            services = filtered
-
-        # ----------------------------------------------------
-        # LIMIT
-        # ----------------------------------------------------
-
-        if args.limit is not None:
-
-            services = services[
-                :args.limit
-            ]
-
-        # ----------------------------------------------------
-        # LIST
-        # ----------------------------------------------------
-
+        documents, errors = collect_catalogs(scopes)
+        for name, message in errors.items():
+            LOG.error("%s: %s", name, message)
+        if not documents:
+            return 1 if errors else 0
+        documents = filter_documents(documents, args)
+        if args.test_only:
+            from collections import Counter
+            counts = Counter(doc.scope for doc in documents)
+            for scope in scopes:
+                if scope.slug in errors:
+                    print(f"{scope.label}: ERROR")
+                else:
+                    print(f"{scope.label}: {counts[scope.slug]} accessible documents | GetService and GetServiceById PASS")
+            print("PDF download: NOT TESTED")
+            return 1 if errors else 0
         if args.list:
-
-            collector.list_services(
-                services
-            )
-
-            return 0
-
-        # ----------------------------------------------------
-        # EMPTY
-        # ----------------------------------------------------
-
-        if not services:
-
-            LOG.warning(
-                "No documents matched the selected filters."
-            )
-
-            return 0
-
-        # ----------------------------------------------------
-        # COLLECT
-        # ----------------------------------------------------
-
-        return collector.collect(
-            services
-        )
-
-    except AuthenticationError as exc:
-
-        LOG.error(
-            "AUTHENTICATION ERROR: %s",
-            exc,
-        )
-
-        LOG.error(
-            "Refresh the authorized browser session "
-            "and verify credentials stored in .env."
-        )
-
+            from rich.table import Table
+            table = Table(title="TIRD / Advisor + Business Insights")
+            for heading in ("CATEGORY", "ISSUE", "DATE", "NEWSLETTER"):
+                table.add_column(heading)
+            for doc in documents:
+                subtitle = service_subtitle_of(doc.service)
+                issued = parse_thai_date(subtitle)
+                table.add_row(doc.label, parse_edition(subtitle) or "-", issued.strftime("%Y-%m-%d") if issued else "-", service_title_of(doc.service))
+            console.print(table) if console else print(f"{len(documents)} records")
+            return 1 if errors else 0
+        archive = ParallelArchive(scopes, config, force=args.force)
+        stats = archive.collect(documents)
+        print(f"COMPLETE / saved {stats['downloaded']} / skipped {stats['skipped']} / failed {stats['failed']}")
+        return 1 if stats['failed'] or errors else 0
+    except (TIRDError, OSError, ValueError) as exc:
+        LOG.error("TIRD ERROR: %s", exc)
         return 1
-
-    except APIResponseError as exc:
-
-        LOG.error(
-            "API RESPONSE ERROR: %s",
-            exc,
-        )
-
-        LOG.error(
-            "Run with --test-only --verbose --debug-response "
-            "to inspect safe response diagnostics."
-        )
-
-        return 1
-
-    except CurlError as exc:
-
-        LOG.error(
-            "CURL ERROR: %s",
-            exc,
-        )
-
-        return 1
-
-    except PDFDownloadError as exc:
-
-        LOG.error(
-            "PDF ERROR: %s",
-            exc,
-        )
-
-        return 1
-
     except KeyboardInterrupt:
-
-        LOG.warning(
-            "Interrupted by user."
-        )
-
-        show_summary(
-            collector.stats,
-            config.output,
-        )
-
+        LOG.warning("Interrupted")
         return 130
-
-    except (
-        TIRDError,
-        OSError,
-        ValueError,
-    ) as exc:
-
-        LOG.error(
-            "Collector stopped: %s",
-            exc,
-        )
-
-        return 1
 
 
 if __name__ == "__main__":
+    # Unify exception/model types when scope helpers import this script.
+    sys.modules.setdefault("tird_collector", sys.modules[__name__])
     sys.exit(main())
