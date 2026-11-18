@@ -13,7 +13,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tird_collector as api
-from tird_scopes import ScopedDocument, ParallelArchive, configured_scopes, collect_catalogs
+from tird_scopes import (
+    ScopedDocument, ParallelArchive, configured_scopes, collect_catalogs,
+    diagnose_scope_routing,
+)
 
 
 class ScopeTests(unittest.TestCase):
@@ -66,6 +69,97 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(len(documents), 1)
         self.assertEqual(documents[0].scope, "advisor")
         self.assertIn("insights", errors)
+
+    def test_aba_routing_reuses_credentials_and_switches_only_referer(self):
+        with patch.dict(os.environ, {
+            "TIRD_ADVISOR_REFERER": "https://tirdmember.tird.insure/Content?_mId=A",
+            "TIRD_INSIGHTS_REFERER": "https://tirdmember.tird.insure/Content?_mId=I",
+            "TIRD_INSIGHTS_COOKIE": "",
+            "TIRD_INSIGHTS_AUTHORIZATION": "",
+        }):
+            scopes = configured_scopes(self.base)
+        calls = []
+        class FakeClient:
+            def __init__(self, config, *args, **kwargs):
+                self.config = config
+            def get_services(self):
+                calls.append((
+                    self.config.referer, self.config.cookie,
+                    self.config.authorization,
+                ))
+                if self.config.referer.endswith("=A"):
+                    return [{"Service_id": "advisor-1"}, {"Service_id": "advisor-2"}]
+                return [{"Service_id": "insights-1"}]
+        with patch.object(api, "TIRDClient", FakeClient):
+            result = diagnose_scope_routing(scopes)
+        self.assertEqual([entry[0][-1] for entry in calls], ["A", "I", "A"])
+        self.assertTrue(all(c[1] == "FAKE=VALUE" for c in calls))
+        self.assertTrue(all(c[2] == "TEST_ONLY" for c in calls))
+        self.assertEqual((result.advisor_first, result.insights, result.advisor_repeat), (2, 1, 2))
+        self.assertEqual(result.overlap, 0)
+        self.assertTrue(result.consistent)
+        self.assertTrue(result.shared_credentials)
+
+    def test_aba_detects_server_side_session_switch(self):
+        with patch.dict(os.environ, {
+            "TIRD_ADVISOR_REFERER": "https://tirdmember.tird.insure/Content?_mId=A",
+            "TIRD_INSIGHTS_REFERER": "https://tirdmember.tird.insure/Content?_mId=I",
+        }):
+            scopes = configured_scopes(self.base)
+        counters = {"A": 0}
+        class FakeClient:
+            def __init__(self, config, *args, **kwargs):
+                self.referer = config.referer
+            def get_services(self):
+                if self.referer.endswith("=I"):
+                    return [{"Service_id": "insights-1"}]
+                counters["A"] += 1
+                return [{"Service_id": f"advisor-{counters['A']}"}]
+        with patch.object(api, "TIRDClient", FakeClient):
+            result = diagnose_scope_routing(scopes)
+        self.assertFalse(result.advisor_stable)
+        self.assertFalse(result.consistent)
+
+    def test_partially_overlapping_catalog_is_not_mislabeled(self):
+        with patch.dict(os.environ, {
+            "TIRD_ADVISOR_REFERER": "https://tirdmember.tird.insure/Content?_mId=A",
+            "TIRD_INSIGHTS_REFERER": "https://tirdmember.tird.insure/Content?_mId=I",
+        }):
+            scopes = configured_scopes(self.base)
+        class FakeClient:
+            def __init__(self, config, *args, **kwargs):
+                self.referer = config.referer
+            def get_services(self):
+                ids = ["A", "SHARED"] if self.referer.endswith("=A") else ["I", "SHARED"]
+                return [{"Service_id": i} for i in ids]
+            def get_service_key(self, service_id):
+                return "workspace"
+        with patch.object(api, "TIRDClient", FakeClient):
+            documents, errors = collect_catalogs(scopes)
+        self.assertEqual([item.service["Service_id"] for item in documents], ["A", "SHARED"])
+        self.assertIn("overlaps", errors["insights"])
+
+    def test_same_routing_inputs_are_detected_without_duplicate_request(self):
+        same = "https://tirdmember.tird.insure/Content?_mId=A"
+        with patch.dict(os.environ, {
+            "TIRD_ADVISOR_REFERER": same,
+            "TIRD_INSIGHTS_REFERER": same,
+            "TIRD_INSIGHTS_COOKIE": "",
+            "TIRD_INSIGHTS_AUTHORIZATION": "",
+        }):
+            scopes = configured_scopes(self.base)
+        calls = []
+        class FakeClient:
+            def __init__(self, *args, **kwargs): pass
+            def get_services(self):
+                calls.append(1)
+                return [{"Service_id": "A"}]
+            def get_service_key(self, service_id): return "workspace"
+        with patch.object(api, "TIRDClient", FakeClient):
+            documents, errors = collect_catalogs(scopes)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(documents), 1)
+        self.assertIn("same Referer", errors["insights"])
 
     def test_parallel_download_uses_concurrency_and_separate_manifests(self):
         with patch.dict(os.environ, {"TIRD_INSIGHTS_REFERER": "https://tirdmember.tird.insure/Content?_mId=I"}):
