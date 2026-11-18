@@ -18,7 +18,7 @@ from typing import Any, Sequence
 # Verified on 2026-11-18: Actuarial Advisory / Article Research (3 IDs).
 ADVISOR_IDS = frozenset({
     "70daccca-c63a-4e62-9acc-062c931534df",
-    "853ed0c6-4dfb-491f-ab6a47ee00490505",
+    "853ed0c6-4dfb-491f-ab6b-47ee00490505",
     "6b68f97c-2e87-4b6f-8e47-02c699cd304f",
 })
 
