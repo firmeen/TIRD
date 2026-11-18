@@ -2853,6 +2853,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--diagnose-scopes",
+        action="store_true",
+        help="Test Advisor -> Insights -> Advisor catalog routing (no PDFs)",
+    )
+
+    parser.add_argument(
         "--ui",
         action="store_true",
         help="Launch Textual interface",
@@ -3006,7 +3012,9 @@ def main() -> int:
         LOG.error("CONFIGURATION ERROR: %s", exc)
         return 2
 
-    interactive = args.ui or not (args.test_only or args.list or args.headless)
+    interactive = args.ui or not (
+        args.test_only or args.list or args.headless or args.diagnose_scopes
+    )
     if interactive:
         try:
             from tird_ui import run_app
@@ -3017,6 +3025,27 @@ def main() -> int:
 
     show_header()
     try:
+        if args.diagnose_scopes:
+            from tird_scopes import diagnose_scope_routing
+            report = diagnose_scope_routing(scopes)
+            print("TIRD A/B/A ROUTING DIAGNOSTIC")
+            print(f"Advisor first:   {report.advisor_first} documents")
+            print(f"Insights:        {report.insights} documents")
+            print(f"Advisor repeat:  {report.advisor_repeat} documents")
+            print(f"Overlap:         {report.overlap} Service IDs")
+            print(f"Advisor stable:  {report.advisor_stable}")
+            print(f"Distinct:        {report.distinct}")
+            print(f"Shared session:  {report.shared_credentials}")
+            print(
+                "Result:          " + (
+                    "PASS (referer routing consistent)"
+                    if report.consistent else
+                    "FAIL (verify menu URLs and server-side session context)"
+                )
+            )
+            print("PDF download:   NOT TESTED")
+            return 0 if report.consistent else 1
+
         documents, errors = collect_catalogs(scopes)
         for name, message in errors.items():
             LOG.error("%s: %s", name, message)
