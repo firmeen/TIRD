@@ -16,7 +16,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, ProgressBar, RichLog, Select, Static
 
-from tird_scopes import configured_scopes, collect_catalogs, ParallelArchive, ScopedDocument
+from tird_scopes import configured_scopes, collect_catalogs, diagnose_scope_routing, ParallelArchive, ScopedDocument
 
 
 class TIRDApp(App):
@@ -24,6 +24,7 @@ class TIRDApp(App):
     SUB_TITLE = "Advisor + Business Insights / Parallel PDF archive"
     BINDINGS = [
         ("ctrl+r", "refresh", "Refresh"),
+        ("ctrl+t", "verify_routing", "Verify A/B/A"),
         ("ctrl+d", "download_selected", "Download selected"),
         ("ctrl+o", "open_output", "Open folder"),
         ("ctrl+s", "stop", "Stop"),
@@ -43,6 +44,7 @@ class TIRDApp(App):
     Button:hover { background: #3d6b80; }
     Button:disabled { opacity: 0.45; }
     #download_selected, #download_all { background: #24675c; }
+    #verify { background: #665637; }
     #stop { background: #70474b; }
     #filters { height: 5; margin-top: 1; }
     .field { width: 1fr; margin-right: 1; }
@@ -92,6 +94,7 @@ class TIRDApp(App):
             yield Static("SESSION / NOT CHECKED", id="status")
             with Horizontal(id="toolbar"):
                 yield Button("REFRESH", id="refresh")
+                yield Button("VERIFY A/B/A", id="verify")
                 yield Button("DOWNLOAD SELECTED", id="download_selected")
                 yield Button("DOWNLOAD ALL", id="download_all")
                 yield Button("STOP", id="stop")
@@ -146,6 +149,7 @@ class TIRDApp(App):
 
     def _buttons(self) -> None:
         self.query_one("#refresh", Button).disabled = self.busy or self.refreshing
+        self.query_one("#verify", Button).disabled = self.busy or self.refreshing
         self.query_one("#download_selected", Button).disabled = self.busy or self.refreshing or not self.loaded
         self.query_one("#download_all", Button).disabled = self.busy or self.refreshing or not self.loaded
         self.query_one("#stop", Button).disabled = not self.busy
@@ -225,6 +229,58 @@ class TIRDApp(App):
         self._session("CHECKING", "Advisor + Business Insights")
         self.write_log("Fetching section catalogs with curl.exe...")
         self._load_worker()
+
+    def action_verify_routing(self) -> None:
+        """Run three live catalog requests without any PDF downloads."""
+        if self.busy or self.refreshing:
+            return
+        self.refreshing = True
+        self._buttons()
+        self._session("CHECKING", "Advisor -> Insights -> Advisor")
+        self.write_log("Verifying the two menu Referers using A/B/A catalog requests...")
+        self._verify_worker()
+
+    @work(thread=True, group="routing", exclusive=True)
+    def _verify_worker(self) -> None:
+        try:
+            base = self.api.Config.load(self.args)
+            scopes = configured_scopes(base, "both")
+            result = diagnose_scope_routing(scopes)
+            self.call_from_thread(self._verify_done, result, None)
+        except Exception as exc:
+            self.call_from_thread(
+                self._verify_done, None, f"{type(exc).__name__}: {exc}"
+            )
+
+    def _verify_done(self, result: Any | None, error: str | None) -> None:
+        self.refreshing = False
+        self._buttons()
+        if error:
+            self._session("ERROR", "A/B/A routing failed; see activity log")
+            self.write_log(f"ROUTING TEST ERROR: {error}", "error")
+            return
+        level = "ok" if result.consistent else "warn"
+        state = "CONNECTED" if result.consistent else "PARTIAL"
+        self._session(
+            state,
+            f"A {result.advisor_first} / B {result.insights} / "
+            f"A {result.advisor_repeat}, overlap={result.overlap}"
+        )
+        self.write_log(
+            f"A/B/A {'PASS' if result.consistent else 'FAIL'}: "
+            f"Advisor {result.advisor_first} -> "
+            f"Insights {result.insights} -> "
+            f"Advisor {result.advisor_repeat}; "
+            f"overlap={result.overlap}; stable={result.advisor_stable}; "
+            f"shared_credentials={result.shared_credentials}. No PDFs downloaded.",
+            level,
+        )
+        if not result.consistent:
+            self.write_log(
+                "Do not assume section labels are correct; confirm each "
+                "menu Referer and inspect requests made before GetService.",
+                "warn",
+            )
 
     @work(thread=True, group="catalog", exclusive=True)
     def _load_worker(self) -> None:
@@ -369,6 +425,7 @@ class TIRDApp(App):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
             "refresh": self.action_refresh,
+            "verify": self.action_verify_routing,
             "download_selected": self.action_download_selected,
             "download_all": self.action_download_all,
             "stop": self.action_stop,
