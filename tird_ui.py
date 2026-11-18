@@ -228,129 +228,178 @@ class TIRDApp(App):
         self._summary()
 
     def action_refresh(self) -> None:
-        if self.busy or self.refreshing:
+        """Poll the currently active browser session, at most once at a time."""
+        if self.busy or self.poll_paused or self.refreshing:
             return
         self.refreshing = True
-        self.loaded = False
+        if not self.loaded:
+            self._session("CHECKING", "Reading latest Chrome session catalog")
         self._buttons()
-        self._session("CHECKING", "Advisor + Business Insights")
-        self.write_log("Fetching section catalogs with curl.exe...")
         self._load_worker()
 
-    def action_verify_routing(self) -> None:
-        """Run three live catalog requests without any PDF downloads."""
-        if self.busy or self.refreshing:
-            return
-        self.refreshing = True
-        self._buttons()
-        self._session("CHECKING", "Advisor -> Insights -> Advisor")
-        self.write_log("Verifying the two menu Referers using A/B/A catalog requests...")
-        self._verify_worker()
-
-    @work(thread=True, group="routing", exclusive=True)
-    def _verify_worker(self) -> None:
-        try:
-            base = self.api.Config.load(self.args)
-            scopes = configured_scopes(base, "both")
-            result = diagnose_scope_routing(scopes)
-            self.call_from_thread(self._verify_done, result, None)
-        except Exception as exc:
-            self.call_from_thread(
-                self._verify_done, None, f"{type(exc).__name__}: {exc}"
-            )
-
-    def _verify_done(self, result: Any | None, error: str | None) -> None:
-        self.refreshing = False
-        self._buttons()
-        if error:
-            self._session("ERROR", "A/B/A routing failed; see activity log")
-            self.write_log(f"ROUTING TEST ERROR: {error}", "error")
-            return
-        level = "ok" if result.consistent else "warn"
-        state = "CONNECTED" if result.consistent else "PARTIAL"
-        self._session(
-            state,
-            f"A {result.advisor_first} / B {result.insights} / "
-            f"A {result.advisor_repeat}, overlap={result.overlap}"
-        )
-        self.write_log(
-            f"A/B/A {'PASS' if result.consistent else 'FAIL'}: "
-            f"Advisor {result.advisor_first} -> "
-            f"Insights {result.insights} -> "
-            f"Advisor {result.advisor_repeat}; "
-            f"overlap={result.overlap}; stable={result.advisor_stable}; "
-            f"shared_credentials={result.shared_credentials}. No PDFs downloaded.",
-            level,
-        )
-        if not result.consistent:
-            self.write_log(
-                "Do not assume section labels are correct; confirm each "
-                "menu Referer and inspect requests made before GetService.",
-                "warn",
-            )
-
-    @work(thread=True, group="catalog", exclusive=True)
+    @work(thread=True, group="live-catalog", exclusive=True)
     def _load_worker(self) -> None:
         try:
             base = self.api.Config.load(self.args)
-            scopes = configured_scopes(base, self.args.scope)
-            documents, errors = collect_catalogs(scopes)
-            states = {}
-            legacy_manifest = self.api.Manifest(base.output, verify_existing=base.verify_existing)
-            for scope in scopes:
-                if scope.config is None:
-                    continue
-                manifest = self.api.Manifest(scope.config.output, verify_existing=base.verify_existing)
-                for document in documents:
-                    if document.scope == scope.slug:
-                        service_id = self.api.service_id_of(document.service)
-                        if manifest.completed(service_id) or (scope.slug == "advisor" and legacy_manifest.completed(service_id)):
-                            states[document.key] = "SAVED"
-            self.call_from_thread(self._load_done, scopes, documents, states, errors, base.output, None)
+            scope, documents, identity = fetch_live_snapshot(base)
+            self.call_from_thread(
+                self._load_done, scope, documents, identity, base.output, None
+            )
         except Exception as exc:
-            self.call_from_thread(self._load_done, [], [], {}, {}, self.output, f"{type(exc).__name__}: {exc}")
+            self.call_from_thread(
+                self._load_done, None, [], None, self.output,
+                f"{type(exc).__name__}: {exc}"
+            )
 
-    def _load_done(self, scopes: list, documents: list, states: dict, errors: dict, output: Path, error: str | None) -> None:
+    def _load_done(
+        self,
+        scope: Any | None,
+        documents: list[ScopedDocument],
+        identity: Any | None,
+        output: Path,
+        error: str | None,
+    ) -> None:
         self.refreshing = False
+
+        # Download pressed while this poll was in flight. Do not apply the
+        # in-flight response: use the exact CATALOG ALREADY DISPLAYED when
+        # the user pressed Download and wait for the poll to finish first.
+        if self.pending_download is not None:
+            selected = self.pending_download
+            self.pending_download = None
+            self._start_download(selected)
+            return
+
+        if self.busy or self.poll_paused:
+            return
+
         if error:
-            self._session("ERROR", "See activity log")
-            self.write_log(error, "error")
-        else:
-            self.scopes = scopes
-            self.documents = documents
-            self.states = states
-            self.errors = errors
-            self.output = output
-            self.selected.intersection_update({d.key for d in documents})
-            self.loaded = bool(documents)
-            counts = Counter(doc.scope for doc in documents)
-            state = "PARTIAL" if errors else "CONNECTED"
-            self._session(state, f"Advisor {counts['advisor']} / Insights {counts['insights']} / workers {self.args.parallel}")
-            for name, message in errors.items():
-                self.write_log(f"{name.upper()}: {message}", "warn")
-            self.write_log(f"Catalog ready: {len(documents)} documents from {len(scopes)-len(errors)} sections", "ok" if not errors else "warn")
+            self.loaded = False  # Stale catalog is not safe to download.
+            self._session("ERROR", "Live session unavailable / download disabled")
+            if error != self.last_poll_error:
+                self.write_log(f"Poll error: {error}", "error")
+            self.last_poll_error = error
+            self.query_one("#current_category", Static).update(
+                f"STALE / {LABELS[self.active_scope]}"
+            )
+            self._buttons()
+            return
+
+        recovered = self.last_poll_error is not None
+        self.last_poll_error = None
+        self.output = output
+        assert identity is not None
+        signature = (identity.scope, catalog_signature([d.service for d in documents]))
+        changed = signature != self.catalog_signature
+        self.loaded = bool(scope is not None and documents)
+
+        if changed:
+            previous_scope = self.active_scope
+            self.active_scope = identity.scope
+            self.catalog_signature = signature
+            self.scopes = [scope] if scope is not None else []
+            self.documents = documents  # REPLACE, never accumulate two sections.
+            if previous_scope != self.active_scope:
+                self.selected.clear()
+            else:
+                self.selected.intersection_update({d.key for d in documents})
+
+            self.states = {}
+            if scope is not None:
+                manifest = self.api.Manifest(
+                    scope.config.output, verify_existing=scope.config.verify_existing
+                )
+                legacy_manifest = self.api.Manifest(
+                    output, verify_existing=scope.config.verify_existing
+                )
+                for document in documents:
+                    service_id = self.api.service_id_of(document.service)
+                    if (
+                        manifest.completed(service_id)
+                        or (
+                            known_scope_for_id(service_id) == identity.scope
+                            and legacy_manifest.completed(service_id)
+                        )
+                    ):
+                        self.states[document.key] = "SAVED"
+
+            self.query_one("#current_category", Static).update(
+                LABELS[self.active_scope]
+            )
+            level = "ok" if identity.trusted else "warn"
+            self.write_log(
+                f"LIVE CATALOG: {LABELS[self.active_scope]} / "
+                f"{len(documents)} documents / {identity.reason}",
+                level,
+            )
             self._render_catalog()
+
+        if identity.trusted:
+            self._session(
+                "CONNECTED",
+                f"{LABELS[identity.scope]} / {len(documents)} documents / "
+                "auto refresh 1s / Chrome controlled by user",
+            )
+        else:
+            self._session(
+                "PARTIAL", "Unrecognized catalog / download disabled"
+            )
+        if recovered and not changed:
+            self.write_log("Live catalog connection recovered.", "ok")
+            self.query_one("#current_category", Static).update(
+                LABELS[self.active_scope]
+            )
         self._buttons()
 
     def _begin(self, documents: list[ScopedDocument]) -> None:
-        if self.busy or self.refreshing:
+        """Freeze current visible documents, pause polling before downloading."""
+        if self.busy or self.poll_paused:
             return
-        if not self.loaded:
-            self.write_log("Refresh catalog before downloading.", "warn")
+        if not self.loaded or self.active_scope not in ("advisor", "insights"):
+            self.write_log("Wait for a recognized live catalog before downloading.", "warn")
             return
         if not documents:
-            self.write_log("No documents selected.", "warn")
+            self.write_log("No documents selected for this download.", "warn")
             return
+        if any(d.scope != self.active_scope for d in documents):
+            self.write_log("Mixed or stale section detected; download cancelled.", "error")
+            return
+
+        self.poll_paused = True
+        snapshot = list(documents)
+        if self.refreshing:
+            self.pending_download = snapshot
+            self.write_log(
+                "Auto refresh paused. Waiting for in-flight catalog request "
+                "to finish before starting the frozen download snapshot."
+            )
+            self._buttons()
+            self._summary()
+        else:
+            self._start_download(snapshot)
+
+    def _start_download(self, documents: list[ScopedDocument]) -> None:
+        """Called only when no catalog request can overlap the download."""
+        assert not self.refreshing
+        assert self.poll_paused
         self.run_id += 1
         self.busy = True
         self.stats = {"downloaded": 0, "skipped": 0, "failed": 0, "cancelled": 0}
         self.archive = None
         self.stop_pending = False
         self._buttons()
-        self.query_one("#progress", ProgressBar).update(total=len(documents), progress=0)
-        self.query_one("#progress_caption", Static).update(f"RUNNING / 0 of {len(documents)} / {self.args.parallel} parallel workers")
-        self.write_log(f"Parallel download: {len(documents)} documents / {self.args.parallel} workers")
-        self._download_worker(self.run_id, list(documents))
+        self._summary()
+        self.query_one("#progress", ProgressBar).update(
+            total=len(documents), progress=0
+        )
+        self.query_one("#progress_caption", Static).update(
+            f"RUNNING / 0 of {len(documents)} / {self.args.parallel} parallel workers"
+        )
+        self.write_log(
+            f"AUTO REFRESH PAUSED | {LABELS[self.active_scope]} | "
+            f"{len(documents)} documents / {self.args.parallel} workers"
+        )
+        self._download_worker(self.run_id, documents)
 
     def action_download_selected(self) -> None:
         self._begin([d for d in self._filtered() if d.key in self.selected])
@@ -407,6 +456,11 @@ class TIRDApp(App):
             return
         self.busy = False
         self.archive = None
+        self.pending_download = None
+        self.poll_paused = False
+        # The browser may have changed during the transfer. Do not allow
+        # another download until the next live catalog response is received.
+        self.loaded = False
         self._buttons()
         if error:
             self.query_one("#progress_caption", Static).update("ERROR / See activity log")
@@ -417,6 +471,8 @@ class TIRDApp(App):
                 f"{label} / {stats['downloaded']} saved / {stats['skipped']} skipped / {stats['failed']} failed"
             )
             self.write_log(f"PDF archive: {self.output}", "ok")
+        self._session("CHECKING", "Download complete / resuming live catalog sync")
+        self.write_log("AUTO REFRESH RESUMED / next live poll within 1 second")
         self._summary()
 
     def action_open_output(self) -> None:
@@ -432,7 +488,6 @@ class TIRDApp(App):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
             "refresh": self.action_refresh,
-            "verify": self.action_verify_routing,
             "download_selected": self.action_download_selected,
             "download_all": self.action_download_all,
             "stop": self.action_stop,
