@@ -1,67 +1,90 @@
 # TIRD Newsletter Collector
 
-Desktop terminal collector for **Actuarial Advisory** and **Business Insights** research publications. It uses the website's existing, authorized session, `curl.exe` for HTTP, and **Textual/Rich** for the UI. Parallel PDF download uses `ThreadPoolExecutor`, a shared request interval, per-section CSV manifests, PDF-signature checks and SHA256.
+A Python collector for two TIRD sections: **Actuarial Advisory / Article Research**
+and **Business Insights / Newsletter**. The user controls Chrome. The
+**Textual + Rich terminal UI observes the currently active authorized TIRD
+session every 1 second** through one `POST /Content/GetService` request.
 
-## Set up (Windows)
+## How this version works
 
-1. Copy `.env.example` to `.env` in this directory.
-2. Open TIRD in Chrome and sign in normally.
-3. Open **Actuarial Advisory → Article / Research**. In Chrome `F12 → Network → Fetch/XHR`, select `GetService` and copy the `Authorization`, `Cookie`, and **Referer** request headers to `TIRD_AUTHORIZATION`, `TIRD_COOKIE`, `TIRD_REFERER` in `.env`.
-4. Open **Business Insights → Article / Research**, select that page's `GetService` request and copy its Referer to `TIRD_INSIGHTS_REFERER`. Copy the Advisor Referer explicitly to `TIRD_ADVISOR_REFERER` as well. If either request uses a different session, override that section's Cookie and Authorization; **the supplied Nov 18 trace uses the same credentials for both**.
-5. Both requests are **POST /Content/GetService with an empty body**. The evidence shows **different `Referer: /Content?_mId=...` values** and response catalogs of **3 Advisor** and **36 Insights** documents. The program cannot assume that changing Referer alone is always sufficient; test whether server-side session state changes the results by running the A/B/A diagnostic below.
-6. In PowerShell, execute:
+1. **You open Business Insights in Chrome yourself.** The terminal shows its
+   current catalog (36 documents in the supplied November 18 capture), marked
+   **Business Insights**, not Advisor.
+2. **Click Download All.** Auto Refresh immediately pauses. If a poll was
+   already in flight, the collector waits for it to finish, then downloads the
+   *last displayed catalog snapshot* using **3 parallel workers** (1–6
+   configurable). No catalog polls run while downloading.
+3. When the download finishes/stops, Auto Refresh resumes. You then
+   **switch Chrome to Actuarial Advisory yourself**.
+4. Within the next successful poll, the terminal **replaces** the visible list
+   with Advisor's current catalog (3 documents in the supplied capture).
+   Click Download All **a second time** to download the Advisor documents.
 
-   ```powershell
-   python -m pip install -r requirements.txt
-   python tird_collector.py
-   ```
+There is **no browser automation** and **no accumulation of both catalogs in
+the UI**. Files from the two separate download rounds are retained in their
+respective output folders and manifests.
 
-   You can also double-click `START_TIRD.bat` to open the UI.
+### Important routing behavior
 
-**Important:** Two separate pages or different Referers do not necessarily imply two different API results. If both configurations return the same service IDs, the app reports this instead of mislabeling documents. Use DevTools to confirm each section's request/response. If `TIRD_INSIGHTS_REFERER` is missing, the UI still displays Advisor but marks Insights as not configured. The program cannot invent section IDs or acquire credentials automatically.
+The actual TIRD server selects a catalog according to server-side session
+context associated with the user's latest navigation in Chrome. Changing
+`Referer` in an isolated Python request is **not** sufficient to reliably
+change categories. This live UI therefore uses the existing authorized
+`TIRD_AUTHORIZATION` + `TIRD_COOKIE` session for **one catalog request at a
+time**, then **classifies by verified `Service_id` fingerprints**, never by
+Referer, number of documents, or the last category displayed.
 
-## Terminal UI
+The initial reference fingerprints contain the **3 Advisor** and **36
+Business Insights** IDs from the supplied Network captures dated November
+18, 2026. If the API includes new IDs alongside known IDs, the new items
+are included under the recognized category. An entirely new/unrecognized
+catalog or a mixed-category response is displayed as **UNKNOWN**, and
+downloads remain disabled until it can be identified safely. This avoids
+saving Insights under the Advisor label.
 
-- **Category**: All sections / Actuarial Advisory / Business Insights.
-- **Search + year**: filter displayed documents.
-- **Enter**: select or deselect a row.
-- **Download Selected**: collect selected visible rows.
-- **Download All**: collect all visible filtered rows from one or both sections.
-- **Stop**: stop pending work; an in-flight request may finish first.
-- **Open Folder**: inspect PDF output and manifests.
+One request starts each 1-second tick **only if no previous poll is still
+running**. Slow requests are never overlapped. If the poll fails, the UI
+marks the last catalog stale and disables downloads until the connection
+recovers. This doesn't provide a direct link to Chrome and won't necessarily
+detect a change instantly if the API is slow.
 
-Activity, section counts, PDF statuses and progress appear in the terminal.
+## Install and start (Windows)
 
-## CLI commands
+1. In Chrome, sign in to TIRD using your own authorized session.
+2. Copy `.env.example` to `.env` (or keep your existing private `.env`).
+3. From Chrome DevTools → Network → `GetService` copy the current
+   `Authorization` and `Cookie` headers. Also set `TIRD_REFERER`
+   to a valid TIRD `/Content?_mId=...` URL from that browser session.
+4. Start the app:
 
 ```powershell
-python tird_collector.py --diagnose-scopes --scope both
-python tird_collector.py --test-only
-python tird_collector.py --list --scope both
-python tird_collector.py --headless --scope both --parallel 3
-python tird_collector.py --headless --scope insights --year 2569 --parallel 3
-python tird_collector.py --headless --scope advisor --limit 1
+python -m pip install -r requirements.txt
 python tird_collector.py --ui
-python -m unittest discover -s tests -v
 ```
 
-`--parallel` defaults to **3**; supports **1–6**. `--delay` defaults to **0.2 seconds minimum between HTTP request starts across all workers**. Do not increase concurrency excessively on this service. `--force` redownloads previously completed PDFs.
+Or double-click `START_TIRD.bat`. Do not publish or commit `.env`.
+`TIRD_ADVISOR_REFERER` and `TIRD_INSIGHTS_REFERER` are **NOT required**
+for the **live UI**; they belong to the earlier separate-Referer CLI
+diagnostic approach. Section-specific Cookie/Authorization values are also
+not required when the two pages share one session.
 
-## Verify section routing (no PDF downloads)
+## Controls
 
-After adding **both explicit Referers** to your private `.env`, run:
+- **Auto Refresh (1s):** always on while idle; no separate setup needed.
+- **Refresh:** manual immediate poll.
+- **Search / Year:** filter the *current* catalog without changing Chrome.
+- **Enter:** select/deselect a row.
+- **Download Selected / Download All:** download the current section only.
+- **Stop:** stop pending transfers; in-flight transfers may finish.
+- **Open Folder:** inspect PDFs and manifests.
 
-```powershell
-python tird_collector.py --diagnose-scopes --scope both
-```
+Only one section is displayed at a time. Download counts apply to the last
+download round; saved file statuses also reflect the manifest. If the user
+switches Chrome while a download is running, the backend session may change
+outside this program's control; **keep Chrome on the same section until that
+download is finished**.
 
-It sends three authenticated curl POST requests, sequentially: **Advisor → Insights → Advisor**. The same Cookie/Authorization from `.env` are reused unless you explicitly set section overrides. It reports the number of returned Service IDs, whether the first/last Advisor ID sets match, the number of IDs overlapping with Insights, and whether session credentials were identical. It never prints credentials or raw Referers.
-
-**Expected from the supplied Nov 18, 2026 trace (not a hard-coded requirement):** Advisor 3 → Insights 36 → Advisor 3, overlap 0, stable True. `PASS` means the independent Referers consistently select disjoint catalogs for these requests. `FAIL` means the menu routing or server session context needs inspection; **do not assume downloads will be labeled correctly**. This diagnostic checks catalog routing only, not PDF access. After PASS, use `--test-only` to check GetServiceById for each section.
-
-The two `_mId` strings are opaque menu/session routing values; **never commit live values from your own browser**. The example placeholders intentionally contain no real session values. The legacy `TIRD_REFERER` is used only as a compatibility fallback for Advisor. If it actually points to Insights, the program cannot safely infer the correct category: explicitly set `TIRD_ADVISOR_REFERER` and `TIRD_INSIGHTS_REFERER`.
-
-## Files
+## PDF output and existing downloads
 
 ```text
 TIRD_Newsletter/
@@ -73,6 +96,31 @@ TIRD_Newsletter/
     YYYY/MM/*.pdf
 ```
 
-Old v4 PDFs under the previous output layout are untouched and recognized from the root manifest as completed Advisor documents. Each category has its own resume manifest and each PDF is validated before being marked saved. The app does not bypass authentication or TLS verification.
+Downloads use the existing curl.exe engine, `ThreadPoolExecutor`, shared
+request rate limiter, retry/timeout handling, atomic writes, PDF signature
+checks and SHA256. Prior PDFs in the old root manifest are recognized by
+their **verified service ID** and credited to the *correct* section even if
+the previous UI had labeled a 36-item Insights catalog as Advisor. Existing
+files are not renamed or moved.
 
-**Security:** Never commit `.env`, curl commands containing live cookies, or personal access tokens. Refresh the browser session if credentials have previously been shared. The live two-section API requests and PDF transfers must be verified on your own authorized Windows session.
+## CLI and tests
+
+```powershell
+python tird_collector.py --ui --parallel 3
+python tird_collector.py --ui --parallel 6
+python -m unittest discover -s tests -v
+```
+
+Legacy `--list`, `--test-only`, `--scope`, `--headless` and
+`--diagnose-scopes` remain from PR #3, but they still implement the old
+two-Referer workflow and must **not** be treated as proof that the
+server selected the requested section. For the session-driven two-round
+workflow, use `--ui`.
+
+**Credentials:** Only use a session you are authorized to access. Credentials
+are read from local `.env`, sent to curl through stdin, and never committed.
+Do not disable TLS verification or automate interactions with Chrome.
+
+**Validation:** Tests exercise simulated API responses and UI behavior.
+The new live 1-second workflow and both real PDF download rounds still need
+to be verified against your authorized Windows browser session.
